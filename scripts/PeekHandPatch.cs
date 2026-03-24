@@ -16,27 +16,55 @@ namespace MultiplayerPeeking;
 [HarmonyPatch(typeof(NMultiplayerPlayerState), "UpdateHighlightedState")]
 public static class PeekHandPatch
 {
-    // NCard 的自然宽度（像素），用于手动排列卡牌位置
-    private const float CardNaturalWidth = 130f;
-    private const float CardScale = 0.65f;
-    private const float CardSpacing = 6f;
+    // NCard.defaultSize = (300, 422)，见游戏源码
+    private const float CardNaturalWidth  = 300f;
+    private const float CardNaturalHeight = 422f;
+    private const float CardScale   = 0.40f;
+    private const float CardSpacing = 8f;
 
-    private static readonly Dictionary<NMultiplayerPlayerState, Control> _overlays = new();
+    // hover 消失后延迟隐藏，避免鼠标短暂离开时闪烁
+    private const double HideDelaySeconds = 0.15;
 
-    // 提前缓存 FieldInfo，避免每帧反射查找
+    private static readonly Dictionary<NMultiplayerPlayerState, Control> _overlays = [];
+    // 每个 state 最多一个挂起的隐藏计时器
+    private static readonly Dictionary<NMultiplayerPlayerState, SceneTreeTimer> _hideTimers = [];
+
     private static readonly FieldInfo _isHighlightedField =
         AccessTools.Field(typeof(NMultiplayerPlayerState), "_isHighlighted");
 
     // Harmony Postfix：在 UpdateHighlightedState 执行完毕后运行
     public static void Postfix(NMultiplayerPlayerState __instance)
     {
-        bool highlighted = (bool)_isHighlightedField.GetValue(__instance);
-        bool hasOverlay = _overlays.ContainsKey(__instance);
+        bool highlighted = _isHighlightedField.GetValue(__instance) is true;
 
-        if (highlighted && !hasOverlay)
-            ShowOverlay(__instance);
-        else if (!highlighted && hasOverlay)
-            HideOverlay(__instance);
+        if (highlighted)
+        {
+            // 取消挂起的隐藏计时器
+            _hideTimers.Remove(__instance);
+
+            if (!_overlays.ContainsKey(__instance))
+                ShowOverlay(__instance);
+        }
+        else if (_overlays.ContainsKey(__instance))
+        {
+            // 已有计时器则不重复创建
+            if (_hideTimers.ContainsKey(__instance)) return;
+
+            var tree = __instance.GetTree();
+            if (tree == null) { HideOverlay(__instance); return; }
+
+            // 延迟隐藏：给鼠标短暂回来的机会
+            var timer = tree.CreateTimer(HideDelaySeconds);
+            _hideTimers[__instance] = timer;
+            timer.Timeout += () =>
+            {
+                _hideTimers.Remove(__instance);
+                // 计时器到期时再次确认 highlighted 状态
+                bool stillHighlighted = _isHighlightedField.GetValue(__instance) is true;
+                if (!stillHighlighted)
+                    HideOverlay(__instance);
+            };
+        }
     }
 
     private static void ShowOverlay(NMultiplayerPlayerState state)
@@ -52,27 +80,38 @@ public static class PeekHandPatch
 
         var overlay = new Control();
         overlay.Name = "PeekHandOverlay";
+        // 设为 Ignore，不拦截鼠标事件，避免遮挡 Hitbox 导致 hover 失效
+        overlay.MouseFilter = Control.MouseFilterEnum.Ignore;
 
+        var cardNodes = new List<NCard>();
         float xOffset = 0f;
         foreach (CardModel card in handCards)
         {
             NCard? cardNode = NCard.Create(card);
             if (cardNode == null) continue;
 
-            cardNode.UpdateVisuals(PileType.Hand, CardPreviewMode.Normal);
-            cardNode.Scale = new Vector2(CardScale, CardScale);
+            cardNode.Scale    = new Vector2(CardScale, CardScale);
             cardNode.Position = new Vector2(xOffset, 0f);
+            cardNode.MouseFilter = Control.MouseFilterEnum.Ignore;
             overlay.AddChild(cardNode);
+            cardNodes.Add(cardNode);
 
             xOffset += CardNaturalWidth * CardScale + CardSpacing;
         }
 
-        // 挂载到全局 UI 根节点，确保渲染在最上层
+        // 先挂载到场景树，使卡牌节点进入 Ready 状态
         Node uiParent = (Node?)NRun.Instance?.GlobalUi ?? state.GetParent();
         uiParent.AddChild(overlay);
 
-        // 悬浮框紧靠状态栏右侧，纵向与状态栏顶端对齐
-        overlay.GlobalPosition = state.GlobalPosition + new Vector2(state.Size.X + 12f, 0f);
+        // 节点 Ready 后再调用 UpdateVisuals，否则内部 IsNodeReady() 检查会直接跳过
+        foreach (NCard cardNode in cardNodes)
+        {
+            cardNode.UpdateVisuals(PileType.Hand, CardPreviewMode.Normal);
+        }
+
+        // 将悬浮框定位在状态栏正上方
+        float scaledHeight = CardNaturalHeight * CardScale;
+        overlay.GlobalPosition = state.GlobalPosition + new Vector2(0f, -(scaledHeight + 12f));
 
         _overlays[state] = overlay;
     }
@@ -81,11 +120,18 @@ public static class PeekHandPatch
     {
         if (!_overlays.Remove(state, out var overlay)) return;
 
-        // 将 NCard 节点归还对象池
+        // 先把卡牌从 overlay 摘除，再归还对象池；
+        // 否则 overlay.QueueFree() 会释放仍被 pool 引用的节点
+        var cards = new List<NCard>();
         foreach (Node child in overlay.GetChildren())
         {
             if (child is NCard card)
-                NodePool.Free(card);
+                cards.Add(card);
+        }
+        foreach (NCard card in cards)
+        {
+            overlay.RemoveChild(card);
+            NodePool.Free(card);
         }
 
         overlay.QueueFree();
