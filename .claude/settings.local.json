@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(/Users/licht./.dotnet/tools/ilspycmd --help)"
+    ]
+  }
+}

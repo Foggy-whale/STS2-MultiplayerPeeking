@@ -1,0 +1,11 @@
+{
+  "id": "MultiplayerPeeking",           
+  "name": "Multiplayer Peeking",
+  "author": "FoggyWhale",
+  "description": "联机模式下，鼠标悬浮在队友头像上可以查看队友手牌；当队友有虚弱、易伤、减少敌人力量、联机专属卡牌时，会给予高亮提示",
+  "version": "1.0",
+  "has_pck": true,         
+  "has_dll": true,        
+  "dependencies": [],     
+  "affects_gameplay": false
+}
