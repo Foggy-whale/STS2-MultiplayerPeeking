@@ -12,8 +12,29 @@ using MegaCrit.Sts2.Core.Nodes;
 using MegaCrit.Sts2.Core.Nodes.Cards;
 using MegaCrit.Sts2.Core.Nodes.Multiplayer;
 using MegaCrit.Sts2.Core.Nodes.Pooling;
+using MegaCrit.Sts2.Core.Nodes.Combat;
+using MegaCrit.Sts2.Core.Nodes.Rooms;
 
 namespace MultiplayerPeeking;
+
+// 战斗开始：直接订阅 Hand.ContentsChanged，任何手牌变化都会触发
+[HarmonyPatch(typeof(NMultiplayerPlayerState), "OnCombatSetUp")]
+public static class PeekHandCombatSetUpPatch
+{
+    public static void Postfix(NMultiplayerPlayerState __instance)
+    {
+        PeekHandPatch.SubscribeHandEvents(__instance);
+        PeekHandPatch.UpdatePurpleGlow(__instance);
+    }
+}
+
+// 战斗结束前：取消订阅（Prefix 确保 PlayerCombatState 还未清空）
+[HarmonyPatch(typeof(NMultiplayerPlayerState), "OnCombatEnded")]
+public static class PeekHandCombatEndedPatch
+{
+    public static void Prefix(NMultiplayerPlayerState __instance)
+        => PeekHandPatch.UnsubscribeHandEvents(__instance);
+}
 
 [HarmonyPatch(typeof(NMultiplayerPlayerState), "UpdateHighlightedState")]
 public static class PeekHandPatch
@@ -32,6 +53,10 @@ public static class PeekHandPatch
     private static readonly Dictionary<NMultiplayerPlayerState, SceneTreeTimer> _hideTimers = [];
     // 鼠标当前是否停在 overlay 上（阻止计时器触发隐藏）
     private static readonly HashSet<NMultiplayerPlayerState> _overlayHovered = [];
+    // 紫色光晕：对角色 Body 施加紫色 Modulate
+    private static readonly Dictionary<NMultiplayerPlayerState, Node2D> _tintedBodies = [];
+    // 直接订阅 Hand.ContentsChanged，存储 handler 以便精确取消订阅
+    private static readonly Dictionary<NMultiplayerPlayerState, Action> _handHandlers = [];
 
     // 橙色：用于"施加虚弱/易伤"卡牌 及 多人专属卡的警示提示框
     // 与游戏内置的 gold/red/playableColor 共用同一套 NCardHighlight shader 机制
@@ -81,6 +106,76 @@ public static class PeekHandPatch
                     HideOverlay(__instance);
             };
         }
+
+        // 每次 hover 状态变化时同步角色轮廓光晕（独立于 hover，常驻显示）
+        UpdatePurpleGlow(__instance);
+    }
+
+    // ── 手牌事件订阅 ─────────────────────────────────────────────────────────
+
+    internal static void SubscribeHandEvents(NMultiplayerPlayerState state)
+    {
+        if (_handHandlers.ContainsKey(state)) return;
+        var player = state.Player;
+        if (player?.PlayerCombatState == null) return;
+        if (player.NetId == LocalContext.NetId) return;
+
+        void handler() => UpdatePurpleGlow(state);
+        player.PlayerCombatState.Hand.ContentsChanged += handler;
+        _handHandlers[state] = handler;
+    }
+
+    internal static void UnsubscribeHandEvents(NMultiplayerPlayerState state)
+    {
+        if (!_handHandlers.Remove(state, out var handler)) return;
+        var player = state.Player;
+        if (player?.PlayerCombatState != null)
+            player.PlayerCombatState.Hand.ContentsChanged -= handler;
+    }
+
+    // ── 紫色角色光晕 ─────────────────────────────────────────────────────────
+
+    private static bool HasPurpleCards(NMultiplayerPlayerState state)
+    {
+        var player = state.Player;
+        if (player?.PlayerCombatState == null) return false;
+        if (player.NetId == LocalContext.NetId) return false;
+        return player.PlayerCombatState.Hand.Cards.Any(card =>
+            card.MultiplayerConstraint == CardMultiplayerConstraint.MultiplayerOnly
+            || card.DynamicVars.Values.Any(v => v.GetType() == _weakVarType
+                                             || v.GetType() == _vulnerableVarType));
+    }
+
+    internal static void UpdatePurpleGlow(NMultiplayerPlayerState state)
+    {
+        bool hasPurple = HasPurpleCards(state);
+        if (hasPurple && !_tintedBodies.ContainsKey(state))
+            ShowPurpleGlow(state);
+        else if (!hasPurple && _tintedBodies.ContainsKey(state))
+            RemovePurpleGlow(state);
+    }
+
+    private static void ShowPurpleGlow(NMultiplayerPlayerState state)
+    {
+        NCreature? nCreature = NCombatRoom.Instance?.GetCreatureNode(state.Player?.Creature);
+        if (nCreature == null) return;
+
+        Node2D body = nCreature.Body;
+        body.Modulate = new Color(0.55f, 0.35f, 1.0f, 1.0f);
+
+        nCreature.TreeExited += () =>
+        {
+            if (_tintedBodies.Remove(state, out var b) && GodotObject.IsInstanceValid(b))
+                b.Modulate = Colors.White;
+        };
+
+        _tintedBodies[state] = body;
+    }
+
+    private static void RemovePurpleGlow(NMultiplayerPlayerState state)
+    {
+        if (_tintedBodies.Remove(state, out var body) && GodotObject.IsInstanceValid(body))
+            body.Modulate = Colors.White;
     }
 
     private static void ShowOverlay(NMultiplayerPlayerState state)
