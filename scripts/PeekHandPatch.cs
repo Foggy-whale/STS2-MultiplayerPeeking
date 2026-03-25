@@ -1,11 +1,13 @@
-using System.Collections.Generic;
 using System.Reflection;
 using Godot;
 using HarmonyLib;
+using MegaCrit.Sts2.Core.Combat;
 using MegaCrit.Sts2.Core.Context;
 using MegaCrit.Sts2.Core.Entities.Cards;
 using MegaCrit.Sts2.Core.Entities.Players;
+using MegaCrit.Sts2.Core.Localization.DynamicVars;
 using MegaCrit.Sts2.Core.Models;
+using MegaCrit.Sts2.Core.Models.Powers;
 using MegaCrit.Sts2.Core.Nodes;
 using MegaCrit.Sts2.Core.Nodes.Cards;
 using MegaCrit.Sts2.Core.Nodes.Multiplayer;
@@ -30,6 +32,15 @@ public static class PeekHandPatch
     private static readonly Dictionary<NMultiplayerPlayerState, SceneTreeTimer> _hideTimers = [];
     // 鼠标当前是否停在 overlay 上（阻止计时器触发隐藏）
     private static readonly HashSet<NMultiplayerPlayerState> _overlayHovered = [];
+
+    // 橙色：用于"施加虚弱/易伤"卡牌 及 多人专属卡的警示提示框
+    // 与游戏内置的 gold/red/playableColor 共用同一套 NCardHighlight shader 机制
+    private static readonly Color Pantone2096C = new Color(0.396f, 0.306f, 0.639f, 0.98f);
+
+    // 通过 DynamicVars 检测卡牌是否包含 PowerVar<WeakPower> / PowerVar<VulnerablePower>
+    // （游戏用 PowerVar<T> 声明卡牌会施加哪种 Power，这是最可靠的静态检测方式）
+    private static readonly Type _weakVarType       = typeof(PowerVar<WeakPower>);
+    private static readonly Type _vulnerableVarType = typeof(PowerVar<VulnerablePower>);
 
     private static readonly FieldInfo _isHighlightedField =
         AccessTools.Field(typeof(NMultiplayerPlayerState), "_isHighlighted");
@@ -141,6 +152,7 @@ public static class PeekHandPatch
         foreach (NCard cardNode in cardNodes)
         {
             cardNode.UpdateVisuals(PileType.Hand, CardPreviewMode.Normal);
+            ApplyHighlight(cardNode);
         }
 
         // 延后一帧设置位置，确保 Hitbox 布局已完成，Size 已填充
@@ -157,6 +169,35 @@ public static class PeekHandPatch
         }).CallDeferred();
 
         _overlays[state] = overlay;
+    }
+
+    // 优先级（高→低）：红 > 橙 > 金
+    //   红：游戏原生 ShouldGlowRed（Osty 角色相关、Enthralled 诅咒等）
+    //   橙：施加虚弱/易伤的卡牌（DynamicVars 含 PowerVar<WeakPower/VulnerablePower>）
+    //       + 多人专属卡（MultiplayerOnly），对旁观者来说是重要警示
+    //   金：游戏原生 ShouldGlowGold（跟进等特殊触发条件满足，仅可打出时显示）
+    private static void ApplyHighlight(NCard cardNode)
+    {
+        var model = cardNode.Model;
+        if (model == null) return;
+
+        bool isRed    = model.ShouldGlowRed;
+        bool isOrange = model.MultiplayerConstraint == CardMultiplayerConstraint.MultiplayerOnly
+                     || model.DynamicVars.Values.Any(v => v.GetType() == _weakVarType
+                                                       || v.GetType() == _vulnerableVarType);
+        bool isGold   = model.CanPlay() && model.ShouldGlowGold;
+
+        if (isRed || isOrange || isGold)
+        {
+            cardNode.CardHighlight.Modulate = isRed    ? NCardHighlight.red
+                                            : isOrange ? Pantone2096C
+                                                       : NCardHighlight.gold;
+            cardNode.CardHighlight.AnimShow();
+        }
+        else
+        {
+            cardNode.CardHighlight.AnimHideInstantly();
+        }
     }
 
     private static void HideOverlay(NMultiplayerPlayerState state)
