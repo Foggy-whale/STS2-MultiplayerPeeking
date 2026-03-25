@@ -18,16 +18,18 @@ public static class PeekHandPatch
 {
     // NCard.defaultSize = (300, 422)，见游戏源码
     private const float CardNaturalWidth  = 300f;
-    private const float CardNaturalHeight = 422f;
-    private const float CardScale   = 0.40f;
+
+    private const float CardScale   = 0.4f;
     private const float CardSpacing = 8f;
 
-    // hover 消失后延迟隐藏，避免鼠标短暂离开时闪烁
-    private const double HideDelaySeconds = 0.15;
+    // hover 消失后延迟隐藏，给鼠标从状态栏移向右侧卡牌的时间
+    private const double HideDelaySeconds = 0;
 
     private static readonly Dictionary<NMultiplayerPlayerState, Control> _overlays = [];
     // 每个 state 最多一个挂起的隐藏计时器
     private static readonly Dictionary<NMultiplayerPlayerState, SceneTreeTimer> _hideTimers = [];
+    // 鼠标当前是否停在 overlay 上（阻止计时器触发隐藏）
+    private static readonly HashSet<NMultiplayerPlayerState> _overlayHovered = [];
 
     private static readonly FieldInfo _isHighlightedField =
         AccessTools.Field(typeof(NMultiplayerPlayerState), "_isHighlighted");
@@ -47,21 +49,24 @@ public static class PeekHandPatch
         }
         else if (_overlays.ContainsKey(__instance))
         {
+            // 鼠标已移到 overlay 上，不隐藏
+            if (_overlayHovered.Contains(__instance)) return;
+
             // 已有计时器则不重复创建
             if (_hideTimers.ContainsKey(__instance)) return;
 
             var tree = __instance.GetTree();
             if (tree == null) { HideOverlay(__instance); return; }
 
-            // 延迟隐藏：给鼠标短暂回来的机会
+            // 延迟隐藏：给鼠标从状态栏移向右侧卡牌的时间
             var timer = tree.CreateTimer(HideDelaySeconds);
             _hideTimers[__instance] = timer;
             timer.Timeout += () =>
             {
                 _hideTimers.Remove(__instance);
-                // 计时器到期时再次确认 highlighted 状态
+                // 计时器到期时再次确认：若鼠标在 overlay 上则仍不隐藏
                 bool stillHighlighted = _isHighlightedField.GetValue(__instance) is true;
-                if (!stillHighlighted)
+                if (!stillHighlighted && !_overlayHovered.Contains(__instance))
                     HideOverlay(__instance);
             };
         }
@@ -80,11 +85,14 @@ public static class PeekHandPatch
 
         var overlay = new Control();
         overlay.Name = "PeekHandOverlay";
-        // 设为 Ignore，不拦截鼠标事件，避免遮挡 Hitbox 导致 hover 失效
-        overlay.MouseFilter = Control.MouseFilterEnum.Ignore;
+        // Pass：接收 MouseEntered/Exited 信号以维持 hover 状态，同时不阻断下层点击
+        overlay.MouseFilter = Control.MouseFilterEnum.Pass;
 
+        // NCard 视觉原点在卡牌中心：第一张牌从 halfCardWidth 开始，
+        // 使其视觉左边缘恰好落在 overlay 原点（x=0），方便外部精确定位 overlay
         var cardNodes = new List<NCard>();
-        float xOffset = 0f;
+        float scaledHalfWidth = CardNaturalWidth * CardScale / 2f;
+        float xOffset = scaledHalfWidth;
         foreach (CardModel card in handCards)
         {
             NCard? cardNode = NCard.Create(card);
@@ -99,6 +107,32 @@ public static class PeekHandPatch
             xOffset += CardNaturalWidth * CardScale + CardSpacing;
         }
 
+        // 鼠标进入 overlay 区域时取消挂起的隐藏计时器
+        overlay.MouseEntered += () =>
+        {
+            _overlayHovered.Add(state);
+            _hideTimers.Remove(state);
+        };
+        // 鼠标离开 overlay 区域时启动隐藏计时器
+        overlay.MouseExited += () =>
+        {
+            _overlayHovered.Remove(state);
+            bool highlighted = _isHighlightedField.GetValue(state) is true;
+            if (!highlighted && _overlays.ContainsKey(state) && !_hideTimers.ContainsKey(state))
+            {
+                var tree = state.GetTree();
+                if (tree == null) { HideOverlay(state); return; }
+                var timer = tree.CreateTimer(HideDelaySeconds);
+                _hideTimers[state] = timer;
+                timer.Timeout += () =>
+                {
+                    _hideTimers.Remove(state);
+                    if (_isHighlightedField.GetValue(state) is not true && !_overlayHovered.Contains(state))
+                        HideOverlay(state);
+                };
+            }
+        };
+
         // 先挂载到场景树，使卡牌节点进入 Ready 状态
         Node uiParent = (Node?)NRun.Instance?.GlobalUi ?? state.GetParent();
         uiParent.AddChild(overlay);
@@ -109,9 +143,18 @@ public static class PeekHandPatch
             cardNode.UpdateVisuals(PileType.Hand, CardPreviewMode.Normal);
         }
 
-        // 将悬浮框定位在状态栏正上方
-        float scaledHeight = CardNaturalHeight * CardScale;
-        overlay.GlobalPosition = state.GlobalPosition + new Vector2(0f, -(scaledHeight + 12f));
+        // 延后一帧设置位置，确保 Hitbox 布局已完成，Size 已填充
+        Callable.From(() =>
+        {
+            if (!overlay.IsInsideTree()) return;
+            // 锚点取 Hitbox（可见黄色框），而非外层隐形容器
+            // NCard 视觉原点在卡牌中心，Y 取 Hitbox 中线
+            var hitbox = state.Hitbox;
+            overlay.GlobalPosition = new Vector2(
+                hitbox.GlobalPosition.X + hitbox.Size.X + 24f ,
+                hitbox.GlobalPosition.Y + hitbox.Size.Y / 2f
+            );
+        }).CallDeferred();
 
         _overlays[state] = overlay;
     }
