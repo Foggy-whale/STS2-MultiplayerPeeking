@@ -6,7 +6,7 @@
 <img width="3840" height="2160" alt="e2c3376eb2c0fc96640a48dd569f8791" src="https://github.com/user-attachments/assets/46b51e5a-02f4-44ce-b91e-c57f56803b66" />
 
 ## 安装指南
-直接在release界面下载最新版本的zip压缩包，解压到游戏根目录的mod目录下即可使用
+直接在[release](https://github.com/Foggy-whale/STS2-MultiplayerPeeking/releases)界面下载最新版本的zip压缩包，解压到游戏根目录的mod目录下即可使用
 
 ## 关于存档
 杀戮尖塔2的存档在启用mod和不启用mod的情况下是不互通的。
