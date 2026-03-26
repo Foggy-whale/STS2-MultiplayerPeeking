@@ -11,7 +11,7 @@
 ## 关于存档
 杀戮尖塔2的存档在启用mod和不启用mod的情况下是不互通的。
 
-如果你是第一次安装mod，你需要将 %AppData%\SlayTheSpire2\steam\{一串id} 目录下的profile文件夹复制到modded目录下
+如果你是第一次安装mod，你需要将 %AppData%\SlayTheSpire2\steam\\{一串id} 目录下的profile文件夹复制到modded目录下
 
 ## 最后
 该模组还属于测试阶段，如果存在bug，希望你能通过issue进行反馈~
