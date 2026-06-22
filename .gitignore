@@ -10,3 +10,12 @@ packages/
 .editorconfig
 *cs.uid
 *.user
+
+# OS / editor / tool artifacts
+.DS_Store
+**/.DS_Store
+.claude/
+*.lscache
+
+# Local build / release output
+/dist/

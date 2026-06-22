@@ -1,9 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(/Users/licht./.dotnet/tools/ilspycmd --help)",
-      "Bash(DOTNET_ROLL_FORWARD=Major ilspycmd \"E:/SteamLibrary/steamapps/common/Slay the Spire 2/data_sts2_windows_x86_64/sts2.dll\")",
-      "Read(//c/Users/周小童/Downloads/MultiplayerPeeking/**)"
-    ]
-  }
-}
