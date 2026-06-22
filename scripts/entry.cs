@@ -19,6 +19,11 @@ public partial class Entry : Node
         harmony.PatchAll();
 
         ScriptManagerBridge.LookupScriptsInAssembly(typeof(Entry).Assembly);
+
+        // 载入持久化设置，并订阅「设置变更 → 实时重建 overlay/缩略图/光晕」
+        PeekSettings.Load();
+        PeekSettings.Changed += PeekHandPatch.OnSettingsChanged;
+
         Log.Debug("Mod initialized!");
     }
 }

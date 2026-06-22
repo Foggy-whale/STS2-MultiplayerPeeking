@@ -25,47 +25,56 @@ public static class PeekHandCombatSetUpPatch
     {
         PeekHandPatch.SubscribeHandEvents(__instance);
         PeekHandPatch.UpdatePurpleGlow(__instance);
+        PeekHandPatch.RebuildThumbnail(__instance);
     }
 }
 
-// 战斗结束前：取消订阅（Prefix 确保 PlayerCombatState 还未清空）
+// 战斗结束前：取消订阅 + 清理 overlay/缩略图（Prefix 确保 PlayerCombatState 还未清空）
 [HarmonyPatch(typeof(NMultiplayerPlayerState), "OnCombatEnded")]
 public static class PeekHandCombatEndedPatch
 {
     public static void Prefix(NMultiplayerPlayerState __instance)
-        => PeekHandPatch.UnsubscribeHandEvents(__instance);
+    {
+        PeekHandPatch.UnsubscribeHandEvents(__instance);
+        PeekHandPatch.HideOverlay(__instance);
+        PeekHandPatch.DestroyThumbnail(__instance);
+    }
 }
 
 [HarmonyPatch(typeof(NMultiplayerPlayerState), "UpdateHighlightedState")]
 public static class PeekHandPatch
 {
-    // NCard.defaultSize = (300, 422)，见游戏源码
+    // NCard.defaultSize = (300, 422)
     private const float CardNaturalWidth  = 300f;
+    private const float CardNaturalHeight = 422f;
 
-    private const float CardScale   = 0.4f;
-    private const float CardSpacing = 8f;
-
-    // hover 消失后延迟隐藏，给鼠标从状态栏移向右侧卡牌的时间
-    private const double HideDelaySeconds = 0;
+    // 所有可调参数现由 PeekSettings 提供（在使用处直接读取，不缓存，以便即时生效）
 
     private static readonly Dictionary<NMultiplayerPlayerState, Control> _overlays = [];
+
+    // 常态缩略图：每个远程队友一条，独立于 hover 的 _overlays
+    private static readonly Dictionary<NMultiplayerPlayerState, Control> _thumbnails = [];
+
     // 每个 state 最多一个挂起的隐藏计时器
     private static readonly Dictionary<NMultiplayerPlayerState, SceneTreeTimer> _hideTimers = [];
+
     // 鼠标当前是否停在 overlay 上（阻止计时器触发隐藏）
     private static readonly HashSet<NMultiplayerPlayerState> _overlayHovered = [];
-    // 紫色光晕：对角色 Body 施加紫色 Modulate
+
+    // 对角色 Body 施加紫色光效
     private static readonly Dictionary<NMultiplayerPlayerState, Node2D> _tintedBodies = [];
+
     // 直接订阅 Hand.ContentsChanged，存储 handler 以便精确取消订阅
     private static readonly Dictionary<NMultiplayerPlayerState, Action> _handHandlers = [];
 
-    // 橙色：用于"施加虚弱/易伤"卡牌 及 多人专属卡的警示提示框
+    // 紫色警示色（卡牌高光）与身体光晕色现由 PeekSettings.WarningColor / BodyGlowColor 提供，
     // 与游戏内置的 gold/red/playableColor 共用同一套 NCardHighlight shader 机制
-    private static readonly Color Pantone2096C = new Color(0.396f, 0.306f, 0.639f, 0.98f);
 
     // 通过 DynamicVars 检测卡牌是否包含 PowerVar<WeakPower> / PowerVar<VulnerablePower>
-    // （游戏用 PowerVar<T> 声明卡牌会施加哪种 Power，这是最可靠的静态检测方式）
+    // 或含 key "StrengthLoss"（减少敌人力量，如尖啸）
     private static readonly Type _weakVarType       = typeof(PowerVar<WeakPower>);
     private static readonly Type _vulnerableVarType = typeof(PowerVar<VulnerablePower>);
+    private const string StrengthLossKey = "StrengthLoss";
 
     private static readonly FieldInfo _isHighlightedField =
         AccessTools.Field(typeof(NMultiplayerPlayerState), "_isHighlighted");
@@ -73,6 +82,8 @@ public static class PeekHandPatch
     // Harmony Postfix：在 UpdateHighlightedState 执行完毕后运行
     public static void Postfix(NMultiplayerPlayerState __instance)
     {
+        if (!PeekSettings.MasterEnabled) return;
+
         bool highlighted = _isHighlightedField.GetValue(__instance) is true;
 
         if (highlighted)
@@ -95,7 +106,7 @@ public static class PeekHandPatch
             if (tree == null) { HideOverlay(__instance); return; }
 
             // 延迟隐藏：给鼠标从状态栏移向右侧卡牌的时间
-            var timer = tree.CreateTimer(HideDelaySeconds);
+            var timer = tree.CreateTimer(PeekSettings.HideDelaySec);
             _hideTimers[__instance] = timer;
             timer.Timeout += () =>
             {
@@ -111,7 +122,7 @@ public static class PeekHandPatch
         UpdatePurpleGlow(__instance);
     }
 
-    // ── 手牌事件订阅 ─────────────────────────────────────────────────────────
+    /* == 手牌事件订阅 == */
 
     internal static void SubscribeHandEvents(NMultiplayerPlayerState state)
     {
@@ -120,7 +131,7 @@ public static class PeekHandPatch
         if (player?.PlayerCombatState == null) return;
         if (player.NetId == LocalContext.NetId) return;
 
-        void handler() => UpdatePurpleGlow(state);
+        void handler() => OnHandChanged(state);
         player.PlayerCombatState.Hand.ContentsChanged += handler;
         _handHandlers[state] = handler;
     }
@@ -133,7 +144,7 @@ public static class PeekHandPatch
             player.PlayerCombatState.Hand.ContentsChanged -= handler;
     }
 
-    // ── 紫色角色光晕 ─────────────────────────────────────────────────────────
+    /* == 紫色光效 == */
 
     private static bool HasPurpleCards(NMultiplayerPlayerState state)
     {
@@ -142,17 +153,20 @@ public static class PeekHandPatch
         if (player.NetId == LocalContext.NetId) return false;
         return player.PlayerCombatState.Hand.Cards.Any(card =>
             card.MultiplayerConstraint == CardMultiplayerConstraint.MultiplayerOnly
+            || card.DynamicVars.ContainsKey(StrengthLossKey)
             || card.DynamicVars.Values.Any(v => v.GetType() == _weakVarType
                                              || v.GetType() == _vulnerableVarType));
     }
 
     internal static void UpdatePurpleGlow(NMultiplayerPlayerState state)
     {
-        bool hasPurple = HasPurpleCards(state);
-        if (hasPurple && !_tintedBodies.ContainsKey(state))
+        bool want = PeekSettings.MasterEnabled && PeekSettings.PurpleGlowEnabled && HasPurpleCards(state);
+        if (want && !_tintedBodies.ContainsKey(state))
             ShowPurpleGlow(state);
-        else if (!hasPurple && _tintedBodies.ContainsKey(state))
+        else if (!want && _tintedBodies.ContainsKey(state))
             RemovePurpleGlow(state);
+        else if (want && _tintedBodies.TryGetValue(state, out var body) && GodotObject.IsInstanceValid(body))
+            body.Modulate = PeekSettings.BodyGlowColor; // 颜色可能已变，重新应用
     }
 
     private static void ShowPurpleGlow(NMultiplayerPlayerState state)
@@ -161,7 +175,7 @@ public static class PeekHandPatch
         if (nCreature == null) return;
 
         Node2D body = nCreature.Body;
-        body.Modulate = new Color(0.55f, 0.35f, 1.0f, 1.0f);
+        body.Modulate = PeekSettings.BodyGlowColor;
 
         nCreature.TreeExited += () =>
         {
@@ -180,6 +194,8 @@ public static class PeekHandPatch
 
     private static void ShowOverlay(NMultiplayerPlayerState state)
     {
+        if (!PeekSettings.MasterEnabled) return;
+
         Player player = state.Player;
 
         // 仅在战斗中、且只对远程玩家生效
@@ -191,26 +207,24 @@ public static class PeekHandPatch
 
         var overlay = new Control();
         overlay.Name = "PeekHandOverlay";
-        // Pass：接收 MouseEntered/Exited 信号以维持 hover 状态，同时不阻断下层点击
         overlay.MouseFilter = Control.MouseFilterEnum.Pass;
 
-        // NCard 视觉原点在卡牌中心：第一张牌从 halfCardWidth 开始，
-        // 使其视觉左边缘恰好落在 overlay 原点（x=0），方便外部精确定位 overlay
+        float scale = PeekSettings.CardScale;
         var cardNodes = new List<NCard>();
-        float scaledHalfWidth = CardNaturalWidth * CardScale / 2f;
+        float scaledHalfWidth = CardNaturalWidth * scale / 2f;
         float xOffset = scaledHalfWidth;
         foreach (CardModel card in handCards)
         {
             NCard? cardNode = NCard.Create(card);
             if (cardNode == null) continue;
 
-            cardNode.Scale    = new Vector2(CardScale, CardScale);
+            cardNode.Scale    = new Vector2(scale, scale);
             cardNode.Position = new Vector2(xOffset, 0f);
             cardNode.MouseFilter = Control.MouseFilterEnum.Ignore;
             overlay.AddChild(cardNode);
             cardNodes.Add(cardNode);
 
-            xOffset += CardNaturalWidth * CardScale + CardSpacing;
+            xOffset += CardNaturalWidth * scale + PeekSettings.CardSpacingPx;
         }
 
         // 鼠标进入 overlay 区域时取消挂起的隐藏计时器
@@ -228,7 +242,7 @@ public static class PeekHandPatch
             {
                 var tree = state.GetTree();
                 if (tree == null) { HideOverlay(state); return; }
-                var timer = tree.CreateTimer(HideDelaySeconds);
+                var timer = tree.CreateTimer(PeekSettings.HideDelaySec);
                 _hideTimers[state] = timer;
                 timer.Timeout += () =>
                 {
@@ -254,48 +268,49 @@ public static class PeekHandPatch
         Callable.From(() =>
         {
             if (!overlay.IsInsideTree()) return;
-            // 锚点取 Hitbox（可见黄色框），而非外层隐形容器
-            // NCard 视觉原点在卡牌中心，Y 取 Hitbox 中线
+           
             var hitbox = state.Hitbox;
             overlay.GlobalPosition = new Vector2(
-                hitbox.GlobalPosition.X + hitbox.Size.X + 24f ,
+                hitbox.GlobalPosition.X + hitbox.Size.X + PeekSettings.OverlayGapPx,
                 hitbox.GlobalPosition.Y + hitbox.Size.Y / 2f
             );
         }).CallDeferred();
 
         _overlays[state] = overlay;
+
+        // 显示大图时隐藏该队友的缩略图
+        SetThumbnailVisible(state, false);
     }
 
-    // 优先级（高→低）：红 > 橙 > 金
+    // 优先级（高→低）：紫 > 红 > 金
+    //   紫：施加虚弱/易伤的卡牌（DynamicVars 含 PowerVar<WeakPower/VulnerablePower>）
+    //       + 降低敌人力量 (ContainsKey(StrengthLossKey))
+    //       + 多人专属卡（MultiplayerOnly)
     //   红：游戏原生 ShouldGlowRed（Osty 角色相关、Enthralled 诅咒等）
-    //   橙：施加虚弱/易伤的卡牌（DynamicVars 含 PowerVar<WeakPower/VulnerablePower>）
-    //       + 多人专属卡（MultiplayerOnly），对旁观者来说是重要警示
-    //   金：游戏原生 ShouldGlowGold（跟进等特殊触发条件满足，仅可打出时显示）
+    //   金：游戏原生 ShouldGlowGold（特殊触发条件满足，仅可打出时显示）
     private static void ApplyHighlight(NCard cardNode)
     {
         var model = cardNode.Model;
         if (model == null) return;
 
-        bool isRed    = model.ShouldGlowRed;
-        bool isOrange = model.MultiplayerConstraint == CardMultiplayerConstraint.MultiplayerOnly
+        bool isPurple = model.MultiplayerConstraint == CardMultiplayerConstraint.MultiplayerOnly
+                     || model.DynamicVars.ContainsKey(StrengthLossKey)
                      || model.DynamicVars.Values.Any(v => v.GetType() == _weakVarType
                                                        || v.GetType() == _vulnerableVarType);
+        bool isRed    = model.ShouldGlowRed;
         bool isGold   = model.CanPlay() && model.ShouldGlowGold;
 
-        if (isRed || isOrange || isGold)
+        if (isRed || isPurple || isGold)
         {
-            cardNode.CardHighlight.Modulate = isRed    ? NCardHighlight.red
-                                            : isOrange ? Pantone2096C
-                                                       : NCardHighlight.gold;
+            cardNode.CardHighlight.Modulate = isPurple ? PeekSettings.WarningColor
+                                            : isRed ? NCardHighlight.red
+                                            : NCardHighlight.gold;
             cardNode.CardHighlight.AnimShow();
         }
-        else
-        {
-            cardNode.CardHighlight.AnimHideInstantly();
-        }
+        else cardNode.CardHighlight.AnimHideInstantly();
     }
 
-    private static void HideOverlay(NMultiplayerPlayerState state)
+    internal static void HideOverlay(NMultiplayerPlayerState state)
     {
         if (!_overlays.Remove(state, out var overlay)) return;
 
@@ -314,5 +329,151 @@ public static class PeekHandPatch
         }
 
         overlay.QueueFree();
+
+        // 隐藏大图后恢复该队友的缩略图
+        SetThumbnailVisible(state, true);
+    }
+
+    /* == 手牌变化 == */
+
+    private static void OnHandChanged(NMultiplayerPlayerState state)
+    {
+        UpdatePurpleGlow(state);
+
+        if (PeekSettings.ThumbnailsEnabled)
+            RebuildThumbnail(state);
+
+        // 若当前正显示该队友的大图，则一并重建（手牌已变）
+        if (_overlays.ContainsKey(state))
+        {
+            HideOverlay(state);
+            ShowOverlay(state);
+        }
+    }
+
+    /* == 常态缩略图 == */
+
+    // 卡高略小于状态栏高度：scale = (ThumbnailHeightPct% * 状态栏高) / 422
+    internal static void RebuildThumbnail(NMultiplayerPlayerState state)
+    {
+        DestroyThumbnail(state);
+
+        if (!PeekSettings.MasterEnabled || !PeekSettings.ThumbnailsEnabled) return;
+
+        Player player = state.Player;
+        if (player?.PlayerCombatState == null) return;
+        if (player.NetId == LocalContext.NetId) return;
+
+        var handCards = player.PlayerCombatState.Hand.Cards;
+        if (handCards.Count == 0) return;
+
+        float statusBarHeight = state.Size.Y;
+        if (statusBarHeight <= 0f) statusBarHeight = state.Hitbox?.Size.Y ?? 0f;
+        if (statusBarHeight <= 0f) return;
+
+        float cardHeight = PeekSettings.ThumbnailHeightPct / 100f * statusBarHeight;
+        float scale      = cardHeight / CardNaturalHeight;
+
+        var strip = new Control { Name = "PeekThumbnail", MouseFilter = Control.MouseFilterEnum.Ignore };
+        strip.Modulate = new Color(1f, 1f, 1f, PeekSettings.ThumbnailOpacity);
+
+        var cardNodes = new List<NCard>();
+        float xOffset = CardNaturalWidth * scale / 2f;
+        foreach (CardModel card in handCards)
+        {
+            NCard? cardNode = NCard.Create(card);
+            if (cardNode == null) continue;
+
+            cardNode.Scale    = new Vector2(scale, scale);
+            cardNode.Position = new Vector2(xOffset, 0f);
+            cardNode.MouseFilter = Control.MouseFilterEnum.Ignore;
+            strip.AddChild(cardNode);
+            cardNodes.Add(cardNode);
+
+            xOffset += CardNaturalWidth * scale + PeekSettings.ThumbnailSpacingPx;
+        }
+
+        // 绘制层级高于状态栏；回退到 state 父节点
+        Node uiParent = (Node?)NRun.Instance?.GlobalUi?.AboveTopBarVfxContainer ?? state.GetParent();
+        uiParent.AddChild(strip);
+
+        foreach (NCard cardNode in cardNodes)
+        {
+            cardNode.UpdateVisuals(PileType.Hand, CardPreviewMode.Normal);
+            if (PeekSettings.ThumbnailShowGlow) ApplyHighlight(cardNode);
+            else cardNode.CardHighlight.AnimHideInstantly();
+        }
+
+        // 延后一帧定位：垂直居中于状态栏、置于其右侧
+        Callable.From(() =>
+        {
+            if (!strip.IsInsideTree()) return;
+            var hitbox = state.Hitbox;
+            if (hitbox == null) return;
+            strip.GlobalPosition = new Vector2(
+                hitbox.GlobalPosition.X + hitbox.Size.X + PeekSettings.OverlayGapPx,
+                hitbox.GlobalPosition.Y + (hitbox.Size.Y - cardHeight) / 2f
+            );
+        }).CallDeferred();
+
+        _thumbnails[state] = strip;
+
+        // 若该队友当前被悬停，则保持缩略图隐藏（让大图显示）
+        if (_isHighlightedField.GetValue(state) is true)
+            strip.Visible = false;
+    }
+
+    internal static void DestroyThumbnail(NMultiplayerPlayerState state)
+    {
+        if (!_thumbnails.Remove(state, out var strip)) return;
+
+        // 先把卡牌摘除并归还对象池，再 QueueFree（与 HideOverlay 一致）
+        var cards = new List<NCard>();
+        foreach (Node child in strip.GetChildren())
+        {
+            if (child is NCard card)
+                cards.Add(card);
+        }
+        foreach (NCard card in cards)
+        {
+            strip.RemoveChild(card);
+            NodePool.Free(card);
+        }
+        strip.QueueFree();
+    }
+
+    private static void SetThumbnailVisible(NMultiplayerPlayerState state, bool visible)
+    {
+        if (PeekSettings.ThumbnailsEnabled
+            && _thumbnails.TryGetValue(state, out var strip)
+            && GodotObject.IsInstanceValid(strip))
+            strip.Visible = visible;
+    }
+
+    /* == 设置即时生效 == */
+
+    internal static void OnSettingsChanged()
+    {
+        // 拆除所有当前 overlay / 缩略图，随后按最新设置重建
+        foreach (var s in _overlays.Keys.ToList()) HideOverlay(s);
+        foreach (var s in _thumbnails.Keys.ToList()) DestroyThumbnail(s);
+
+        var container = NRun.Instance?.GlobalUi?.MultiplayerPlayerContainer;
+        if (container == null) return;
+
+        for (int i = 0; i < container.GetChildCount(); i++)
+        {
+            var state = container.GetChildOrNull<NMultiplayerPlayerState>(i);
+            if (state == null) continue;
+
+            UpdatePurpleGlow(state); // 遵循 Master / PurpleGlowEnabled / 新颜色
+
+            if (PeekSettings.MasterEnabled && PeekSettings.ThumbnailsEnabled)
+                RebuildThumbnail(state);
+
+            // 为当前正被悬停的队友恢复大图
+            if (PeekSettings.MasterEnabled && _isHighlightedField.GetValue(state) is true)
+                ShowOverlay(state);
+        }
     }
 }

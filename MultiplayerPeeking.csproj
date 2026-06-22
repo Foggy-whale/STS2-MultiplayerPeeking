@@ -80,25 +80,12 @@
     <ItemGroup>
         <PackageReference Include="Alchyr.Sts2.BaseLib" Version="*" PrivateAssets="All" />
         <PackageReference Include="Alchyr.Sts2.ModAnalyzers" Version="*" />
-        <AdditionalFiles Include="ModTemplate/localization/**/*.json"/>
-    </ItemGroup>
-
-    <ItemGroup>
-        <Compile Remove="ModTemplate/**" />
-        <Compile Remove="materials/**" />
-        <Compile Remove="shaders/**" />
-        <Compile Remove="images/**" />
-        <EmbeddedResource Remove="ModTemplate/**" />
-        <EmbeddedResource Remove="materials/**" />
-        <EmbeddedResource Remove="shaders/**" />
-        <EmbeddedResource Remove="images/**" />
     </ItemGroup>
 
     <ItemGroup>
         <None Include=".gitignore" />
-        <None Include="ModTemplate.json" />
         <None Include="project.godot"/>
-        <None Include="ModTemplate/**" />
+        <None Include="MultiplayerPeeking/**" />
     </ItemGroup>
 
     <ItemGroup>
@@ -121,11 +108,6 @@
         <Message Text="Copying .dll and manifest to mods folder." Importance="high" />
         <Copy SourceFiles="$(TargetPath)" DestinationFolder="$(ModsPath)$(MSBuildProjectName)/" />
         <Copy SourceFiles="MultiplayerPeeking.json" DestinationFolder="$(ModsPath)$(MSBuildProjectName)/" />
-        <Message Text="Copying BaseLib to mods folder." Importance="high" />
-        <ItemGroup>
-            <BaseLibFiles Include="$(NuGetPackageRoot)/alchyr.sts2.baselib/**/lib/**/BaseLib.dll;$(NuGetPackageRoot)/alchyr.sts2.baselib/**/Content/BaseLib.pck;$(NuGetPackageRoot)/alchyr.sts2.baselib/**/Content/BaseLib.json;"/>
-        </ItemGroup>
-        <Copy SourceFiles="@(BaseLibFiles)" DestinationFolder="$(ModsPath)BaseLib/" />
     </Target>
 
     <Target Name="GodotPublish" AfterTargets="Publish" Condition="'$(GodotPath)' != '' and Exists('$(GodotPath)') and '$(IsInnerGodotExport)' != 'true'">
