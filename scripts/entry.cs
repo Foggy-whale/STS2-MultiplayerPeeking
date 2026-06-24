@@ -24,6 +24,12 @@ public partial class Entry : Node
         PeekSettings.Load();
         PeekSettings.Changed += PeekHandPatch.OnSettingsChanged;
 
+        // 把设置注册到 ModConfig 的「模组配置」标签（软依赖，没装 ModConfig 则静默跳过）
+        PeekModConfigBridge.DeferredRegister();
+
+        // 【开发用】场景内实时调参面板（F8 开关，默认隐藏；发布版把 PeekDevPanel.Enabled 置 false）
+        PeekDevPanel.Install();
+
         Log.Debug("Mod initialized!");
     }
 }

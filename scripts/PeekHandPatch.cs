@@ -36,6 +36,7 @@ public static class PeekHandCombatEndedPatch
     public static void Prefix(NMultiplayerPlayerState __instance)
     {
         PeekHandPatch.UnsubscribeHandEvents(__instance);
+        PeekHandPatch.ForgetHighlight(__instance);
         PeekHandPatch.HideOverlay(__instance);
         PeekHandPatch.DestroyThumbnail(__instance);
     }
@@ -47,6 +48,12 @@ public static class PeekHandPatch
     // NCard.defaultSize = (300, 422)
     private const float CardNaturalWidth  = 300f;
     private const float CardNaturalHeight = 422f;
+
+    // 状态栏几何（来自场景 ui/multiplayer_player_state.tscn）：行高 64px，
+    // 内容右缘 ≈ TopInfoContainer.offset_right(261) + 余量。用作【稳定】右侧锚点，
+    // 避免依赖只在 hover 时才赋值的 Hitbox.Size.X（非 hover 时为 0 → 会盖住状态栏）。
+    private const float BarHeight       = 64f;
+    private const float BarContentRight = 267f;
 
     // 所有可调参数现由 PeekSettings 提供（在使用处直接读取，不缓存，以便即时生效）
 
@@ -60,6 +67,9 @@ public static class PeekHandPatch
 
     // 鼠标当前是否停在 overlay 上（阻止计时器触发隐藏）
     private static readonly HashSet<NMultiplayerPlayerState> _overlayHovered = [];
+
+    // 当前被悬停（高亮）的队友集合；只要非空，就隐藏【所有】缩略图（不止被悬停那一个）
+    private static readonly HashSet<NMultiplayerPlayerState> _highlightedStates = [];
 
     // 对角色 Body 施加紫色光效
     private static readonly Dictionary<NMultiplayerPlayerState, Node2D> _tintedBodies = [];
@@ -86,36 +96,49 @@ public static class PeekHandPatch
 
         bool highlighted = _isHighlightedField.GetValue(__instance) is true;
 
+        // 「自己」（本地玩家）的状态栏也在容器里：悬停自己时不应隐藏队友缩略图，
+        // 只有悬停【远程队友】才触发隐藏。
+        bool isLocal = __instance.Player != null && __instance.Player.NetId == LocalContext.NetId;
+
         if (highlighted)
         {
-            // 取消挂起的隐藏计时器
-            _hideTimers.Remove(__instance);
-
-            if (!_overlays.ContainsKey(__instance))
-                ShowOverlay(__instance);
-        }
-        else if (_overlays.ContainsKey(__instance))
-        {
-            // 鼠标已移到 overlay 上，不隐藏
-            if (_overlayHovered.Contains(__instance)) return;
-
-            // 已有计时器则不重复创建
-            if (_hideTimers.ContainsKey(__instance)) return;
-
-            var tree = __instance.GetTree();
-            if (tree == null) { HideOverlay(__instance); return; }
-
-            // 延迟隐藏：给鼠标从状态栏移向右侧卡牌的时间
-            var timer = tree.CreateTimer(PeekSettings.HideDelaySec);
-            _hideTimers[__instance] = timer;
-            timer.Timeout += () =>
+            if (!isLocal)
             {
-                _hideTimers.Remove(__instance);
-                // 计时器到期时再次确认：若鼠标在 overlay 上则仍不隐藏
-                bool stillHighlighted = _isHighlightedField.GetValue(__instance) is true;
-                if (!stillHighlighted && !_overlayHovered.Contains(__instance))
-                    HideOverlay(__instance);
-            };
+                _highlightedStates.Add(__instance);
+                SetAllThumbnailsVisible(false);    // 悬停远程队友 → 隐藏所有缩略图
+            }
+            _hideTimers.Remove(__instance);
+            if (!_overlays.ContainsKey(__instance))
+                ShowOverlay(__instance);           // ShowOverlay 内部已对本地玩家提前返回
+        }
+        else
+        {
+            _highlightedStates.Remove(__instance);
+
+            // 延迟隐藏大图（鼠标在 overlay 上 / 已有计时器时不重复处理）
+            if (_overlays.ContainsKey(__instance)
+                && !_overlayHovered.Contains(__instance)
+                && !_hideTimers.ContainsKey(__instance))
+            {
+                var tree = __instance.GetTree();
+                if (tree == null) HideOverlay(__instance);
+                else
+                {
+                    var timer = tree.CreateTimer(PeekSettings.HideDelaySec);
+                    _hideTimers[__instance] = timer;
+                    timer.Timeout += () =>
+                    {
+                        _hideTimers.Remove(__instance);
+                        bool stillHighlighted = _isHighlightedField.GetValue(__instance) is true;
+                        if (!stillHighlighted && !_overlayHovered.Contains(__instance))
+                            HideOverlay(__instance);
+                    };
+                }
+            }
+
+            // 仅当无人被悬停【且没有大图还在显示】时才恢复缩略图。
+            // 延迟消失期间大图仍在 _overlays 里 → 缩略图保持隐藏，避免两者同时渲染。
+            MaybeRestoreThumbnails();
         }
 
         // 每次 hover 状态变化时同步角色轮廓光晕（独立于 hover，常驻显示）
@@ -261,25 +284,21 @@ public static class PeekHandPatch
         foreach (NCard cardNode in cardNodes)
         {
             cardNode.UpdateVisuals(PileType.Hand, CardPreviewMode.Normal);
-            ApplyHighlight(cardNode);
+            if (PeekSettings.CardGlowEnabled) ApplyHighlight(cardNode);
+            else cardNode.CardHighlight.AnimHideInstantly();
         }
 
-        // 延后一帧设置位置，确保 Hitbox 布局已完成，Size 已填充
+        // 延后一帧设置位置（用稳定的 state 锚点，而非 hover 才赋值的 Hitbox.Size.X）
         Callable.From(() =>
         {
             if (!overlay.IsInsideTree()) return;
-           
-            var hitbox = state.Hitbox;
             overlay.GlobalPosition = new Vector2(
-                hitbox.GlobalPosition.X + hitbox.Size.X + PeekSettings.OverlayGapPx,
-                hitbox.GlobalPosition.Y + hitbox.Size.Y / 2f
+                state.GlobalPosition.X + BarContentRight + PeekSettings.OverlayGapPx,
+                state.GlobalPosition.Y + BarHeight / 2f   // 卡牌 y=0 → 从状态栏中线向下展开（大图保持原样）
             );
         }).CallDeferred();
 
         _overlays[state] = overlay;
-
-        // 显示大图时隐藏该队友的缩略图
-        SetThumbnailVisible(state, false);
     }
 
     // 优先级（高→低）：紫 > 红 > 金
@@ -290,6 +309,10 @@ public static class PeekHandPatch
     //   金：游戏原生 ShouldGlowGold（特殊触发条件满足，仅可打出时显示）
     private static void ApplyHighlight(NCard cardNode)
     {
+        // 防御：高光节点未就绪/脱离场景树时，AnimShow 内部 CreateTween 会失败，
+        // 留下半套用、宽度为 0 的空高光。就绪后由 RebuildAll/ContentsChanged 再次套用。
+        if (cardNode.CardHighlight == null || !cardNode.IsNodeReady()) return;
+
         var model = cardNode.Model;
         if (model == null) return;
 
@@ -330,8 +353,8 @@ public static class PeekHandPatch
 
         overlay.QueueFree();
 
-        // 隐藏大图后恢复该队友的缩略图
-        SetThumbnailVisible(state, true);
+        // 大图真正消失后，若已无人悬停、也无其它大图 → 才恢复缩略图
+        MaybeRestoreThumbnails();
     }
 
     /* == 手牌变化 == */
@@ -353,7 +376,7 @@ public static class PeekHandPatch
 
     /* == 常态缩略图 == */
 
-    // 卡高略小于状态栏高度：scale = (ThumbnailHeightPct% * 状态栏高) / 422
+    // 缩略图 = 大图的等比缩小版：完全相同的布局/锚点，只是 scale = 大图缩放 × 相对比例
     internal static void RebuildThumbnail(NMultiplayerPlayerState state)
     {
         DestroyThumbnail(state);
@@ -367,60 +390,50 @@ public static class PeekHandPatch
         var handCards = player.PlayerCombatState.Hand.Cards;
         if (handCards.Count == 0) return;
 
-        float statusBarHeight = state.Size.Y;
-        if (statusBarHeight <= 0f) statusBarHeight = state.Hitbox?.Size.Y ?? 0f;
-        if (statusBarHeight <= 0f) return;
-
-        float cardHeight = PeekSettings.ThumbnailHeightPct / 100f * statusBarHeight;
-        float scale      = cardHeight / CardNaturalHeight;
+        // 缩略图 = 大图模式的等比缩小版：卡牌布局【逐字照搬大图（ShowOverlay）】——已验证对齐，
+        // 不再自己用锚点数学重算。唯一不同：挂在 state 下用局部坐标（这是 #3 跳位的修法，不能回退）。
+        float scale   = PeekSettings.ThumbnailScalePct / 100f;
+        float spacing = PeekSettings.CardSpacingPx * scale;   // 与大图同一间隔规则，按比例缩小
 
         var strip = new Control { Name = "PeekThumbnail", MouseFilter = Control.MouseFilterEnum.Ignore };
         strip.Modulate = new Color(1f, 1f, 1f, PeekSettings.ThumbnailOpacity);
 
         var cardNodes = new List<NCard>();
-        float xOffset = CardNaturalWidth * scale / 2f;
+        float scaledHalfWidth = CardNaturalWidth * scale / 2f;   // 与大图一致
+        float xOffset = scaledHalfWidth;
         foreach (CardModel card in handCards)
         {
             NCard? cardNode = NCard.Create(card);
             if (cardNode == null) continue;
 
             cardNode.Scale    = new Vector2(scale, scale);
-            cardNode.Position = new Vector2(xOffset, 0f);
+            cardNode.Position = new Vector2(xOffset, 0f);        // 与大图完全相同
             cardNode.MouseFilter = Control.MouseFilterEnum.Ignore;
             strip.AddChild(cardNode);
             cardNodes.Add(cardNode);
 
-            xOffset += CardNaturalWidth * scale + PeekSettings.ThumbnailSpacingPx;
+            xOffset += CardNaturalWidth * scale + spacing;       // 与大图完全相同
         }
 
-        // 绘制层级高于状态栏；回退到 state 父节点
-        Node uiParent = (Node?)NRun.Instance?.GlobalUi?.AboveTopBarVfxContainer ?? state.GetParent();
-        uiParent.AddChild(strip);
+        // 挂在 state 下，局部坐标 = 大图「state 右侧 + 状态栏中线」在 state 局部空间的等价：
+        //   局部(BarContentRight+gap, BarHeight/2)  ≡  全局(state.X+267+gap, state.Y+32)
+        state.AddChild(strip);
+        strip.Position = new Vector2(BarContentRight + PeekSettings.OverlayGapPx, BarHeight / 2f);
 
         foreach (NCard cardNode in cardNodes)
         {
             cardNode.UpdateVisuals(PileType.Hand, CardPreviewMode.Normal);
-            if (PeekSettings.ThumbnailShowGlow) ApplyHighlight(cardNode);
+            // 缩略图高光 = 卡牌高光总开关 且 缩略图子开关 同时开启
+            if (PeekSettings.CardGlowEnabled && PeekSettings.ThumbnailShowGlow) ApplyHighlight(cardNode);
             else cardNode.CardHighlight.AnimHideInstantly();
         }
 
-        // 延后一帧定位：垂直居中于状态栏、置于其右侧
-        Callable.From(() =>
-        {
-            if (!strip.IsInsideTree()) return;
-            var hitbox = state.Hitbox;
-            if (hitbox == null) return;
-            strip.GlobalPosition = new Vector2(
-                hitbox.GlobalPosition.X + hitbox.Size.X + PeekSettings.OverlayGapPx,
-                hitbox.GlobalPosition.Y + (hitbox.Size.Y - cardHeight) / 2f
-            );
-        }).CallDeferred();
-
         _thumbnails[state] = strip;
 
-        // 若该队友当前被悬停，则保持缩略图隐藏（让大图显示）
-        if (_isHighlightedField.GetValue(state) is true)
-            strip.Visible = false;
+        // 可见性单一真源：与 MaybeRestoreThumbnails 判据完全一致——有任一队友被悬停、
+        // 或仍有大图存在时隐藏；否则显示。（旧代码只看 _highlightedStates、漏看 _overlays：
+        // 在悬停/大图存在时重建会把刚建好的缩略图永久藏到下次取消悬停才恢复。）
+        strip.Visible = _highlightedStates.Count == 0 && _overlays.Count == 0;
     }
 
     internal static void DestroyThumbnail(NMultiplayerPlayerState state)
@@ -442,17 +455,51 @@ public static class PeekHandPatch
         strip.QueueFree();
     }
 
-    private static void SetThumbnailVisible(NMultiplayerPlayerState state, bool visible)
+    internal static void ForgetHighlight(NMultiplayerPlayerState state) => _highlightedStates.Remove(state);
+
+    // 任一队友被悬停时隐藏【所有】缩略图；无人被悬停时全部恢复
+    private static void SetAllThumbnailsVisible(bool visible)
     {
-        if (PeekSettings.ThumbnailsEnabled
-            && _thumbnails.TryGetValue(state, out var strip)
-            && GodotObject.IsInstanceValid(strip))
-            strip.Visible = visible;
+        if (!PeekSettings.ThumbnailsEnabled) return;
+        foreach (var strip in _thumbnails.Values)
+            if (GodotObject.IsInstanceValid(strip)) strip.Visible = visible;
+    }
+
+    // 仅当「无人被悬停」且「没有大图还在显示」时才恢复缩略图
+    // （延迟消失期间大图仍在 _overlays 里 → 不恢复，避免大图与缩略图同框）
+    private static void MaybeRestoreThumbnails()
+    {
+        if (_highlightedStates.Count == 0 && _overlays.Count == 0)
+            SetAllThumbnailsVisible(true);
     }
 
     /* == 设置即时生效 == */
 
+    // 设置变更 → 合并到下一帧只重建一次（debounce）。
+    // 根因：ModConfig 的「恢复默认」会逐条触发 OnChanged，一帧内可连发十几次本方法；
+    // 若每次都同步整段销毁重建，中间态会把高光动画/可见性搞乱（= reset 后再开总开关、
+    // 缩略图高光不显示的同步 bug）。合并成「下一帧一次」后，只按最终设置干净地重建一遍。
+    private static bool _rebuildScheduled;
+
     internal static void OnSettingsChanged()
+    {
+        if (_rebuildScheduled) return;
+        if (Engine.GetMainLoop() is SceneTree tree)
+        {
+            _rebuildScheduled = true;
+            tree.ProcessFrame += DebouncedRebuild;
+        }
+        else RebuildAll(); // 无场景树时退化为同步
+    }
+
+    private static void DebouncedRebuild()
+    {
+        if (Engine.GetMainLoop() is SceneTree tree) tree.ProcessFrame -= DebouncedRebuild;
+        _rebuildScheduled = false;
+        RebuildAll();
+    }
+
+    private static void RebuildAll()
     {
         // 拆除所有当前 overlay / 缩略图，随后按最新设置重建
         foreach (var s in _overlays.Keys.ToList()) HideOverlay(s);
@@ -460,6 +507,18 @@ public static class PeekHandPatch
 
         var container = NRun.Instance?.GlobalUi?.MultiplayerPlayerContainer;
         if (container == null) return;
+
+        // 从真实游戏状态重新核对「被悬停」集合：避免遗留的 stale 高亮项把刚重建的
+        // 缩略图/高光误判为「需隐藏」（状态同步——别信旧缓存，以场景实际状态为准）。
+        _highlightedStates.Clear();
+        for (int i = 0; i < container.GetChildCount(); i++)
+        {
+            var state = container.GetChildOrNull<NMultiplayerPlayerState>(i);
+            if (state == null) continue;
+            bool isLocal = state.Player?.NetId == LocalContext.NetId;
+            if (!isLocal && _isHighlightedField.GetValue(state) is true)
+                _highlightedStates.Add(state);
+        }
 
         for (int i = 0; i < container.GetChildCount(); i++)
         {
