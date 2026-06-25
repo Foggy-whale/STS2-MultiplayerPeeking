@@ -144,44 +144,73 @@ internal static class PeekModConfigBridge
         {
             // 注意：DefaultValue 传【出厂默认】（PeekSettings.DefaultXxx），这样 ModConfig 的「恢复默认」
             // 才会还原到真正的默认值；显示值仍取 ModConfig 已存的 json（=上次保存值）。
-            Toggle("MasterEnabled", "Enable Multiplayer Peeking", "启用队友手牌透视（总开关）",
-                PeekSettings.DefaultMasterEnabled, v => { PeekSettings.MasterEnabled = v; Commit(); }),
+            Toggle("MasterEnabled", "Enable Multiplayer Peeking", "启用队友手牌透视（主开关）",
+                PeekSettings.DefaultMasterEnabled, v => { PeekSettings.MasterEnabled = v; Commit(); PeekColorGrid.SetMasterFold(v); }),
 
+            // 设置面板开关快捷键（玩家可改）；改后做冲突检测并把警告写到本行下方
+            KeyBind("PanelHotkey", "Settings panel hotkey", "设置面板快捷键",
+                PeekSettings.DefaultPanelHotkey,
+                k => { PeekSettings.PanelHotkey = k; Commit(); PeekColorGrid.SetHotkeyWarning(PeekDevPanel.HotkeyConflict(k)); }),
+
+            Separator(),
+            Header("Hover overlay", "悬停大图"),
             Slider("CardScalePct", "Hover card size (%)", "悬停卡牌大小 (%)",
                 PeekSettings.DefaultCardScalePct, 10, 100, 1, v => { PeekSettings.CardScalePct = v; Commit(); }),
-            Slider("HideDelayMs", "Overlay hide delay (ms)", "大图延迟消失 (ms)",
+            Slider("HideDelayMs", "Preview hide delay (ms)", "悬停预览延迟消失 (ms)",
                 PeekSettings.DefaultHideDelayMs, 0, 2000, 50, v => { PeekSettings.HideDelayMs = v; Commit(); }),
             Slider("CardSpacingPx", "Hover card spacing (px)", "悬停卡牌间隔 (px)",
                 PeekSettings.DefaultCardSpacingPx, 0, 40, 1, v => { PeekSettings.CardSpacingPx = v; Commit(); }),
             Slider("OverlayGapPx", "Gap from status bar (px)", "与状态栏间距 (px)",
                 PeekSettings.DefaultOverlayGapPx, 0, 120, 1, v => { PeekSettings.OverlayGapPx = v; Commit(); }),
 
+            Separator(),
+            Header("Card highlight", "卡牌高光"),
             // 卡牌高光开关：关 → 不显示卡牌高光；同时让其下方「颜色 hex 行 + 调色盘」折叠隐藏
-            Toggle("CardGlowEnabled", "Card highlight", "卡牌高光",
+            Toggle("CardGlowEnabled", "Card highlight", "启用卡牌高光",
                 PeekSettings.DefaultCardGlowEnabled,
-                v => { PeekSettings.CardGlowEnabled = v; Commit(); PeekColorGrid.SetColorRowVisible("WarningColor", v); }),
+                v => { PeekSettings.CardGlowEnabled = v; Commit(); PeekColorGrid.SetCardFold(v); }),
             // 颜色：保留 hex 精调；其下方由 PeekColorGrid 注入「可折叠的色块矩阵」（点击即用、预览、强绑定 hex）
+            // 颜色：hex 精调；其下方由 PeekColorGrid 注入「可折叠色块矩阵」，含一个【🌈棱彩】预设（选它=开棱彩、选具体色=关棱彩）
             ColorHex("WarningColor", "Card highlight color (hex)", "卡牌高光颜色 (hex)",
                 PeekSettings.DefaultWarningColor, () => PeekSettings.WarningColor, c => { PeekSettings.WarningColor = c; Commit(); }),
+            Slider("OverlayGlowRadiusPct", "Hover glow width (%)", "悬停预览光晕宽度 (%)",
+                PeekSettings.DefaultOverlayGlowRadiusPct, 0, 100, 1, v => { PeekSettings.OverlayGlowRadiusPct = v; Commit(); }),
+            Slider("OverlayGlowOpacityPct", "Hover glow opacity (%)", "悬停预览光晕不透明度 (%)",
+                PeekSettings.DefaultOverlayGlowOpacityPct, 0, 100, 1, v => { PeekSettings.OverlayGlowOpacityPct = v; Commit(); }),
 
+            Separator(),
+            Header("Body glow", "身体光晕"),
             // 身体光晕开关：关 → 不显示身体光晕；同时让其下方颜色行折叠隐藏
-            Toggle("PurpleGlowEnabled", "Body warning glow", "身体警示光晕",
+            Toggle("PurpleGlowEnabled", "Body warning glow", "启用身体光晕",
                 PeekSettings.DefaultPurpleGlowEnabled,
-                v => { PeekSettings.PurpleGlowEnabled = v; Commit(); PeekColorGrid.SetColorRowVisible("BodyGlowColor", v); }),
+                v => { PeekSettings.PurpleGlowEnabled = v; Commit(); PeekColorGrid.SetBodyFold(v); }),
             ColorHex("BodyGlowColor", "Body glow color (hex)", "身体光晕颜色 (hex)",
                 PeekSettings.DefaultBodyGlowColor, () => PeekSettings.BodyGlowColor, c => { PeekSettings.BodyGlowColor = c; Commit(); }),
+            Slider("BodyGlowOpacityPct", "Body glow opacity (%)", "身体光晕不透明度 (%)",
+                PeekSettings.DefaultBodyGlowOpacityPct, 0, 100, 1, v => { PeekSettings.BodyGlowOpacityPct = v; Commit(); }),
 
             Separator(),
             Header("Always-on thumbnails", "常态缩略图"),
 
             Toggle("ThumbnailsEnabled", "Always-on thumbnails", "常态缩略图显示",
-                PeekSettings.DefaultThumbnailsEnabled, v => { PeekSettings.ThumbnailsEnabled = v; Commit(); }),
+                PeekSettings.DefaultThumbnailsEnabled,
+                v => { PeekSettings.ThumbnailsEnabled = v; Commit(); PeekColorGrid.SetThumbnailRowsVisible(v); }),
             Slider("ThumbnailScalePct", "Thumbnail size (%)", "缩略图大小 (%)",
                 PeekSettings.DefaultThumbnailScalePct, 5, 40, 1, v => { PeekSettings.ThumbnailScalePct = v; Commit(); }),
-            Slider("ThumbnailOpacityPct", "Thumbnail opacity (%)", "缩略图透明度 (%)",
+            Slider("ThumbnailSpacingPx", "Thumbnail card spacing (px)", "缩略图卡牌间隔 (px)",
+                PeekSettings.DefaultThumbnailSpacingPx, 0, 40, 1, v => { PeekSettings.ThumbnailSpacingPx = v; Commit(); }),
+            Slider("ThumbnailGapPx", "Thumbnail bar gap (px)", "缩略图与状态栏间距 (px)",
+                PeekSettings.DefaultThumbnailGapPx, 0, 120, 1, v => { PeekSettings.ThumbnailGapPx = v; Commit(); }),
+            Slider("ThumbnailOpacityPct", "Thumbnail opacity (%)", "缩略图不透明度 (%)",
                 PeekSettings.DefaultThumbnailOpacityPct, 20, 100, 1, v => { PeekSettings.ThumbnailOpacityPct = v; Commit(); }),
+            Separator(),
             Toggle("ThumbnailShowGlow", "Highlight on thumbnails", "缩略图显示高光",
-                PeekSettings.DefaultThumbnailShowGlow, v => { PeekSettings.ThumbnailShowGlow = v; Commit(); }),
+                PeekSettings.DefaultThumbnailShowGlow,
+                v => { PeekSettings.ThumbnailShowGlow = v; Commit(); PeekColorGrid.SetThumbGlowFold(v); }),
+            Slider("ThumbnailGlowRadiusPct", "Thumb glow width (%)", "缩略图光晕宽度 (%)",
+                PeekSettings.DefaultThumbnailGlowRadiusPct, 0, 100, 1, v => { PeekSettings.ThumbnailGlowRadiusPct = v; Commit(); }),
+            Slider("ThumbnailGlowOpacityPct", "Thumb glow opacity (%)", "缩略图光晕不透明度 (%)",
+                PeekSettings.DefaultThumbnailGlowOpacityPct, 0, 100, 1, v => { PeekSettings.ThumbnailGlowOpacityPct = v; Commit(); }),
         };
 
         Array arr = Array.CreateInstance(_entryType!, list.Count);
@@ -223,6 +252,14 @@ internal static class PeekModConfigBridge
             if (Color.HtmlIsValid(s)) set(Color.FromHtml(s));
             else Log.Warn($"[MultiplayerPeeking] invalid hex for {key}: '{s}'");
         }));
+    });
+
+    private static object KeyBind(string key, string en, string zh, Key def, Action<Key> onChanged) => Entry(e =>
+    {
+        Set(e, "Key", key); Set(e, "Label", en); Set(e, "Labels", L(en, zh));
+        Set(e, "Type", EnumVal("KeyBind"));
+        Set(e, "DefaultValue", (long)def);     // ModConfig 用 long 存键码
+        Set(e, "OnChanged", (Action<object>)(v => onChanged((Key)Convert.ToInt64(v))));
     });
 
     private static object Header(string en, string zh) => Entry(e =>

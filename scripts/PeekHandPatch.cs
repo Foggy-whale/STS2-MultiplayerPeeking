@@ -39,6 +39,7 @@ public static class PeekHandCombatEndedPatch
         PeekHandPatch.ForgetHighlight(__instance);
         PeekHandPatch.HideOverlay(__instance);
         PeekHandPatch.DestroyThumbnail(__instance);
+        PeekHandPatch.RestoreAllPrismatic();   // 兜底清扫残留棱彩卡
     }
 }
 
@@ -77,6 +78,10 @@ public static class PeekHandPatch
     // 直接订阅 Hand.ContentsChanged，存储 handler 以便精确取消订阅
     private static readonly Dictionary<NMultiplayerPlayerState, Action> _handHandlers = [];
 
+    // 棱彩高光：被换成共享彩虹材质的卡 → 其原始(每卡唯一)材质。归还对象池前据此还原，
+    // 否则池子复用到真实手牌会让真手牌变彩虹（NCard 池可能与游戏共用）。
+    private static readonly Dictionary<NCard, Material> _origHighlightMat = [];
+
     // 紫色警示色（卡牌高光）与身体光晕色现由 PeekSettings.WarningColor / BodyGlowColor 提供，
     // 与游戏内置的 gold/red/playableColor 共用同一套 NCardHighlight shader 机制
 
@@ -102,12 +107,17 @@ public static class PeekHandPatch
 
         if (highlighted)
         {
+            _hideTimers.Remove(__instance);
             if (!isLocal)
             {
                 _highlightedStates.Add(__instance);
                 SetAllThumbnailsVisible(false);    // 悬停远程队友 → 隐藏所有缩略图
+
+                // 互斥：同一时间只显示一个大图 —— 立即隐藏其它所有大图，
+                // 优先级高于其「延迟消失」计时器（切换队友时上一个立刻消失，不与新的共存）
+                foreach (var other in _overlays.Keys.ToList())
+                    if (other != __instance) HideOverlay(other);
             }
-            _hideTimers.Remove(__instance);
             if (!_overlays.ContainsKey(__instance))
                 ShowOverlay(__instance);           // ShowOverlay 内部已对本地玩家提前返回
         }
@@ -189,7 +199,24 @@ public static class PeekHandPatch
         else if (!want && _tintedBodies.ContainsKey(state))
             RemovePurpleGlow(state);
         else if (want && _tintedBodies.TryGetValue(state, out var body) && GodotObject.IsInstanceValid(body))
-            body.Modulate = PeekSettings.BodyGlowColor; // 颜色可能已变，重新应用
+        {
+            if (!PeekSettings.BodyPrismaticGlow) body.Modulate = BodyTint(PeekSettings.BodyGlowColor); // 颜色/不透明度可能已变（棱彩时由 tick 接管）
+        }
+    }
+
+    // 身体染色强度：不透明度 = 白 ↔ 光晕色 的 lerp（alpha 保持 1，身体不透明）
+    private static Color BodyTint(Color glow)
+        => Colors.White.Lerp(new Color(glow.R, glow.G, glow.B, 1f), PeekSettings.BodyGlowOpacity);
+
+    // 身体光晕棱彩：随时间把所有被染色身体的 Modulate 在彩虹色相间流动（身体是 sprite，无环 shader，故用时间循环）
+    internal static void BodyPrismaticTick()
+    {
+        if (!PeekSettings.MasterEnabled || !PeekSettings.PurpleGlowEnabled || !PeekSettings.BodyPrismaticGlow) return;
+        if (_tintedBodies.Count == 0) return;
+        float hue = ((float)Time.GetTicksMsec() / 1000f * 0.25f) % 1f;
+        Color c = BodyTint(Color.FromHsv(hue, 0.85f, 1f));
+        foreach (var body in _tintedBodies.Values)
+            if (GodotObject.IsInstanceValid(body)) body.Modulate = c;
     }
 
     private static void ShowPurpleGlow(NMultiplayerPlayerState state)
@@ -198,7 +225,7 @@ public static class PeekHandPatch
         if (nCreature == null) return;
 
         Node2D body = nCreature.Body;
-        body.Modulate = PeekSettings.BodyGlowColor;
+        body.Modulate = BodyTint(PeekSettings.BodyGlowColor);
 
         nCreature.TreeExited += () =>
         {
@@ -307,10 +334,9 @@ public static class PeekHandPatch
     //       + 多人专属卡（MultiplayerOnly)
     //   红：游戏原生 ShouldGlowRed（Osty 角色相关、Enthralled 诅咒等）
     //   金：游戏原生 ShouldGlowGold（特殊触发条件满足，仅可打出时显示）
-    private static void ApplyHighlight(NCard cardNode)
+    private static void ApplyHighlight(NCard cardNode, bool thumbnail = false)
     {
-        // 防御：高光节点未就绪/脱离场景树时，AnimShow 内部 CreateTween 会失败，
-        // 留下半套用、宽度为 0 的空高光。就绪后由 RebuildAll/ContentsChanged 再次套用。
+        // 防御：高光节点未就绪/脱离场景树时，CreateTween 会失败、留下空高光；就绪后由重建/手牌变化再套用。
         if (cardNode.CardHighlight == null || !cardNode.IsNodeReady()) return;
 
         var model = cardNode.Model;
@@ -325,12 +351,106 @@ public static class PeekHandPatch
 
         if (isRed || isPurple || isGold)
         {
-            cardNode.CardHighlight.Modulate = isPurple ? PeekSettings.WarningColor
-                                            : isRed ? NCardHighlight.red
-                                            : NCardHighlight.gold;
-            cardNode.CardHighlight.AnimShow();
+            // 光晕半径(环宽) + 不透明度：大图 / 缩略图各自独立
+            float radius  = thumbnail ? PeekSettings.ThumbnailGlowRadius  : PeekSettings.OverlayGlowRadius;
+            float opacity = thumbnail ? PeekSettings.ThumbnailGlowOpacity : PeekSettings.OverlayGlowOpacity;
+
+            // 棱彩色：仅替代【紫色警示光】（作为「卡牌高光色」的彩虹预设；红/金保留原生指示）
+            if (isPurple && PeekSettings.PrismaticGlow)
+            {
+                ApplyPrismatic(cardNode, radius, opacity);
+                return;
+            }
+
+            Color c = isPurple ? PeekSettings.WarningColor : isRed ? NCardHighlight.red : NCardHighlight.gold;
+            // 不透明度：缩放 rgb（blend_add 下=调亮度），alpha 保留以维持环形 SDF 形状
+            cardNode.CardHighlight.Modulate = new Color(c.R * opacity, c.G * opacity, c.B * opacity, c.A);
+            if (cardNode.CardHighlight.Material is ShaderMaterial sm)
+                sm.SetShaderParameter("width", radius);   // 光晕半径（环宽）；ripple 仍由 TIME 持续动
         }
         else cardNode.CardHighlight.AnimHideInstantly();
+    }
+
+    /* == 棱彩色（流动彩虹）高光 == */
+
+    // 只取卡牌【轮廓那一圈】（SDF 内缘细环），环上颜色按绕中心角度上色、随时间顺时针流动。blend_add 与原高光一致。
+    // width=光晕半径(环宽)，glow_alpha=不透明度（大图/缩略图各自从设置传入）。
+    private const string PrismaticShaderCode = @"
+shader_type canvas_item;
+render_mode blend_add;
+
+uniform float width = 0.075;
+uniform float glow_alpha = 1.0;
+uniform float hue_speed = 0.15;
+uniform float hue_turns = 1.0;
+
+vec3 hsv2rgb(vec3 c) {
+    vec4 K = vec4(1.0, 2.0/3.0, 1.0/3.0, 3.0);
+    vec3 p = abs(fract(c.xxx + K.xyz) * 6.0 - K.www);
+    return c.z * mix(K.xxx, clamp(p - K.xxx, 0.0, 1.0), c.y);
+}
+
+void fragment() {
+    float a = smoothstep(1.0 - width, 1.0 + width, COLOR.a);   // 只取轮廓那一圈
+    vec2 p = UV - vec2(0.5);
+    float ang = atan(p.y, p.x);
+    float hue = fract(ang / 6.2831853 * hue_turns - TIME * hue_speed);
+    vec3 rainbow = hsv2rgb(vec3(hue, 1.0, 1.0));
+    COLOR = vec4(rainbow * glow_alpha, a);   // glow_alpha=不透明度（blend_add 下调亮度）
+}
+";
+
+    private static Shader? _prismaticShader;
+    private static readonly Dictionary<(float r, float o), ShaderMaterial> _prismaticMats = new();
+    private static ShaderMaterial PrismaticMaterial(float radius, float opacity)
+    {
+        _prismaticShader ??= new Shader { Code = PrismaticShaderCode };
+        var key = (radius, opacity);
+        if (!_prismaticMats.TryGetValue(key, out var mat))
+        {
+            mat = new ShaderMaterial { Shader = _prismaticShader };
+            mat.SetShaderParameter("width", radius);
+            mat.SetShaderParameter("glow_alpha", opacity);   // 同(半径,不透明度)多卡共用一份
+            _prismaticMats[key] = mat;
+        }
+        return mat;
+    }
+
+    private static bool IsPrismaticMat(Material? m) => m is ShaderMaterial sm && _prismaticMats.ContainsValue(sm);
+
+    // 注：换材质后 NCardHighlight._shaderMaterial 仍指向被换下的原始材质（已不生效），
+    // 故 Anim*/SetShaderParameter 对彩虹无影响；棱彩卡只能经 RestoreHighlight+池回收 或整段重建退出。
+    private static void ApplyPrismatic(NCard cardNode, float radius, float opacity)
+    {
+        var hl = cardNode.CardHighlight;
+        var orig = hl.Material;
+        // 防再次中毒：绝不把共享彩虹材质当成「原始材质」存表（否则还原变 no-op，彩虹永久卡住）
+        if (!IsPrismaticMat(orig) && !_origHighlightMat.ContainsKey(cardNode))
+            _origHighlightMat[cardNode] = orig;   // 记住原(每卡唯一)材质，归还池子前还原
+        hl.Material  = PrismaticMaterial(radius, opacity);
+        hl.Modulate  = Colors.White;                      // 形状由 shader 计算的环形 alpha 决定
+    }
+
+    // 归还对象池前还原被换过的高光材质（防止池子复用到真实手牌时把真手牌也变彩虹）。
+    // 返回 true=该卡可安全归还对象池（已成功还原 或 本就非棱彩卡）；false=失效卡，调用方勿入池。
+    private static bool RestoreHighlight(NCard cardNode)
+    {
+        if (!_origHighlightMat.TryGetValue(cardNode, out var mat)) return true;   // 非棱彩卡
+        if (GodotObject.IsInstanceValid(cardNode) && cardNode.CardHighlight != null)
+        {
+            cardNode.CardHighlight.Material = mat;   // 先还原，成功后再移除（顺序很重要）
+            _origHighlightMat.Remove(cardNode);
+            return true;
+        }
+        _origHighlightMat.Remove(cardNode);          // 失效卡：清表；绝不归还池子
+        return false;
+    }
+
+    // 兜底清扫：把残留的棱彩卡全部还原（用于整段重建 / 战斗结束，防止漏网或表内 stale key）
+    internal static void RestoreAllPrismatic()
+    {
+        foreach (var card in _origHighlightMat.Keys.ToList())
+            RestoreHighlight(card);
     }
 
     internal static void HideOverlay(NMultiplayerPlayerState state)
@@ -347,8 +467,10 @@ public static class PeekHandPatch
         }
         foreach (NCard card in cards)
         {
+            bool safe = RestoreHighlight(card);   // 还原棱彩材质；失败=失效卡，不入池
+            if (!GodotObject.IsInstanceValid(card)) continue;
             overlay.RemoveChild(card);
-            NodePool.Free(card);
+            if (safe) NodePool.Free(card);
         }
 
         overlay.QueueFree();
@@ -390,10 +512,10 @@ public static class PeekHandPatch
         var handCards = player.PlayerCombatState.Hand.Cards;
         if (handCards.Count == 0) return;
 
-        // 缩略图 = 大图模式的等比缩小版：卡牌布局【逐字照搬大图（ShowOverlay）】——已验证对齐，
-        // 不再自己用锚点数学重算。唯一不同：挂在 state 下用局部坐标（这是 #3 跳位的修法，不能回退）。
+        // 缩略图卡牌布局沿用大图的对齐方式（已验证）；唯一不同：挂在 state 下用局部坐标（#3 跳位的修法，不能回退）。
+        // 间距已与大图【解耦】：卡牌间隔/与状态栏间距各用缩略图自己的设置（绝对 px）。
         float scale   = PeekSettings.ThumbnailScalePct / 100f;
-        float spacing = PeekSettings.CardSpacingPx * scale;   // 与大图同一间隔规则，按比例缩小
+        float spacing = PeekSettings.ThumbnailSpacingPx;      // 缩略图卡牌间隔（绝对 px，独立于大图）
 
         var strip = new Control { Name = "PeekThumbnail", MouseFilter = Control.MouseFilterEnum.Ignore };
         strip.Modulate = new Color(1f, 1f, 1f, PeekSettings.ThumbnailOpacity);
@@ -418,13 +540,13 @@ public static class PeekHandPatch
         // 挂在 state 下，局部坐标 = 大图「state 右侧 + 状态栏中线」在 state 局部空间的等价：
         //   局部(BarContentRight+gap, BarHeight/2)  ≡  全局(state.X+267+gap, state.Y+32)
         state.AddChild(strip);
-        strip.Position = new Vector2(BarContentRight + PeekSettings.OverlayGapPx, BarHeight / 2f);
+        strip.Position = new Vector2(BarContentRight + PeekSettings.ThumbnailGapPx, BarHeight / 2f);  // 缩略图与状态栏间距（独立于大图）
 
         foreach (NCard cardNode in cardNodes)
         {
             cardNode.UpdateVisuals(PileType.Hand, CardPreviewMode.Normal);
-            // 缩略图高光 = 卡牌高光总开关 且 缩略图子开关 同时开启
-            if (PeekSettings.CardGlowEnabled && PeekSettings.ThumbnailShowGlow) ApplyHighlight(cardNode);
+            // 缩略图高光只由「缩略图显示高光」自身决定（与大图「卡牌高光」解耦）。半径/不透明度走缩略图自己的设置。
+            if (PeekSettings.ThumbnailShowGlow) ApplyHighlight(cardNode, thumbnail: true);
             else cardNode.CardHighlight.AnimHideInstantly();
         }
 
@@ -449,8 +571,10 @@ public static class PeekHandPatch
         }
         foreach (NCard card in cards)
         {
+            bool safe = RestoreHighlight(card);   // 还原棱彩材质；失败=失效卡，不入池
+            if (!GodotObject.IsInstanceValid(card)) continue;
             strip.RemoveChild(card);
-            NodePool.Free(card);
+            if (safe) NodePool.Free(card);
         }
         strip.QueueFree();
     }
@@ -504,6 +628,7 @@ public static class PeekHandPatch
         // 拆除所有当前 overlay / 缩略图，随后按最新设置重建
         foreach (var s in _overlays.Keys.ToList()) HideOverlay(s);
         foreach (var s in _thumbnails.Keys.ToList()) DestroyThumbnail(s);
+        RestoreAllPrismatic();   // 兜底：清掉任何漏网的残留棱彩卡（如关闭棱彩开关时）
 
         var container = NRun.Instance?.GlobalUi?.MultiplayerPlayerContainer;
         if (container == null) return;

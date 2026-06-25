@@ -24,6 +24,10 @@ public partial class Entry : Node
         PeekSettings.Load();
         PeekSettings.Changed += PeekHandPatch.OnSettingsChanged;
 
+        // 身体光晕棱彩：每帧流动身体染色的彩虹色相
+        if (Engine.GetMainLoop() is SceneTree tree)
+            tree.ProcessFrame += PeekHandPatch.BodyPrismaticTick;
+
         // 把设置注册到 ModConfig 的「模组配置」标签（软依赖，没装 ModConfig 则静默跳过）
         PeekModConfigBridge.DeferredRegister();
 
