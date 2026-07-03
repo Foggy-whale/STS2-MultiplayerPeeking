@@ -152,6 +152,14 @@ internal static class PeekModConfigBridge
                 PeekSettings.DefaultPanelHotkey,
                 k => { PeekSettings.PanelHotkey = k; Commit(); PeekColorGrid.SetHotkeyWarning(PeekDevPanel.HotkeyConflict(k)); }),
 
+            // 长按临时隐藏缩略图/大图（留空=鼠标中键）；快速开关缩略图（默认 -）
+            KeyBind("HoldHideKey", "Hold to hide hands (blank = middle mouse)", "长按隐藏手牌（留空=鼠标中键）",
+                PeekSettings.DefaultHoldHideKey,
+                k => { PeekSettings.HoldHideKey = k; Commit(); }),
+            KeyBind("ThumbnailToggleHotkey", "Toggle thumbnails hotkey", "开关缩略图快捷键",
+                PeekSettings.DefaultThumbnailToggleHotkey,
+                k => { PeekSettings.ThumbnailToggleHotkey = k; Commit(); }),
+
             Separator(),
             Header("Hover overlay", "悬停大图"),
             Slider("CardScalePct", "Hover card size (%)", "悬停卡牌大小 (%)",

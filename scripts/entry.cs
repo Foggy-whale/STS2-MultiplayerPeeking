@@ -3,6 +3,7 @@ using Godot.Bridge;
 using HarmonyLib;
 using MegaCrit.Sts2.Core.Logging;
 using MegaCrit.Sts2.Core.Modding;
+using MegaCrit.Sts2.Core.Nodes.Screens.ScreenContext;
 
 namespace MultiplayerPeeking;
 
@@ -24,15 +25,23 @@ public partial class Entry : Node
         PeekSettings.Load();
         PeekSettings.Changed += PeekHandPatch.OnSettingsChanged;
 
-        // 身体光晕棱彩：每帧流动身体染色的彩虹色相
+        // 每帧：①身体光晕棱彩流动 ②长按中键临时隐藏缩略图（读中键实时按住状态）
         if (Engine.GetMainLoop() is SceneTree tree)
+        {
             tree.ProcessFrame += PeekHandPatch.BodyPrismaticTick;
+            tree.ProcessFrame += PeekHandPatch.HoldHideTick;
+        }
+
+        // 活动屏幕门控：打开地图/卡组/抽牌堆/弃牌堆等时收起缩略图/大图（只在战斗视图显示）
+        ActiveScreenContext.Instance.Updated += PeekHandPatch.OnScreenChanged;
 
         // 把设置注册到 ModConfig 的「模组配置」标签（软依赖，没装 ModConfig 则静默跳过）
         PeekModConfigBridge.DeferredRegister();
 
         // 【开发用】场景内实时调参面板（F8 开关，默认隐藏；发布版把 PeekDevPanel.Enabled 置 false）
         PeekDevPanel.Install();
+
+        // 首次广播提示：由 PeekHintBanner 的 Harmony 补丁在【联机选角色】屏幕触发（PatchAll 已应用），无需在此 Install
 
         Log.Debug("Mod initialized!");
     }

@@ -3,9 +3,9 @@
   "name": "Multiplayer Peeking",
   "author": "FoggyWhale",
   "description": "联机模式下，鼠标悬停在队友状态栏/身体上可以查看队友手牌；当队友有虚弱、易伤、减少敌人力量、联机专属卡牌时，会给予紫色光效提示。\nIn multiplayer mode, you can peek the cards in your ally's hand by hovering the mouse over the ally's status-bar or body. When some ally has a card with WeakPower, VulnerablePower, Reducing enemy strength or MultiplayerOnly, there will be a purple glow present as a hint.",
-  "version": "1.1",
+  "version": "1.1.2",
   "has_pck": true,         
   "has_dll": true,        
-  "dependencies": [],     
+  "dependencies": [{ "id": "ModConfig", "min_version": "0.1.3" }],
   "affects_gameplay": false
 }

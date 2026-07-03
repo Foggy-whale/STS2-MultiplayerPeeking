@@ -14,6 +14,7 @@ using MegaCrit.Sts2.Core.Nodes.Multiplayer;
 using MegaCrit.Sts2.Core.Nodes.Pooling;
 using MegaCrit.Sts2.Core.Nodes.Combat;
 using MegaCrit.Sts2.Core.Nodes.Rooms;
+using MegaCrit.Sts2.Core.Nodes.Screens.ScreenContext;
 
 namespace MultiplayerPeeking;
 
@@ -50,11 +51,16 @@ public static class PeekHandPatch
     private const float CardNaturalWidth  = 300f;
     private const float CardNaturalHeight = 422f;
 
-    // 状态栏几何（来自场景 ui/multiplayer_player_state.tscn）：行高 64px，
-    // 内容右缘 ≈ TopInfoContainer.offset_right(261) + 余量。用作【稳定】右侧锚点，
-    // 避免依赖只在 hover 时才赋值的 Hitbox.Size.X（非 hover 时为 0 → 会盖住状态栏）。
-    private const float BarHeight       = 64f;
-    private const float BarContentRight = 267f;
+    // 状态栏几何（来自场景 ui/multiplayer_player_state.tscn）：行高 64px。
+    private const float BarHeight = 64f;
+
+    // 内容右缘（卡条锚点）改为【动态测量】：常规角色 ≈261，但储君会显示「辉星」(StarCount) 那一栏
+    // → TopInfoContainer 更宽，固定值会盖住手牌数(CardCount)。取所有可见信息栏右缘的最大值，
+    // 容器未就绪(布局未完成)时回退到此常量。ContentRightMargin = 原 267-261 的余量。
+    private const float BarContentRightFallback = 267f;
+    private const float ContentRightMargin      = 6f;
+    private static readonly string[] _infoColumns =
+        { "TopInfoContainer", "%EnergyCountContainer", "%StarCountContainer", "%CardCountContainer" };
 
     // 所有可调参数现由 PeekSettings 提供（在使用处直接读取，不缓存，以便即时生效）
 
@@ -72,6 +78,9 @@ public static class PeekHandPatch
     // 当前被悬停（高亮）的队友集合；只要非空，就隐藏【所有】缩略图（不止被悬停那一个）
     private static readonly HashSet<NMultiplayerPlayerState> _highlightedStates = [];
 
+    // 长按中键临时隐藏：反映中键此刻是否按住（按住=隐藏所有缩略图，松开=恢复）。并入可见性判据。
+    private static bool _hideHeld;
+
     // 对角色 Body 施加紫色光效
     private static readonly Dictionary<NMultiplayerPlayerState, Node2D> _tintedBodies = [];
 
@@ -86,10 +95,19 @@ public static class PeekHandPatch
     // 与游戏内置的 gold/red/playableColor 共用同一套 NCardHighlight shader 机制
 
     // 通过 DynamicVars 检测卡牌是否包含 PowerVar<WeakPower> / PowerVar<VulnerablePower>
-    // 或含 key "StrengthLoss"（减少敌人力量，如尖啸）
     private static readonly Type _weakVarType       = typeof(PowerVar<WeakPower>);
     private static readonly Type _vulnerableVarType = typeof(PowerVar<VulnerablePower>);
-    private const string StrengthLossKey = "StrengthLoss";
+    // 「减少敌人力量」的 DynamicVar key（不同卡不同）：尖啸/裂伤=StrengthLoss；命运同担=EnemyStrengthLoss。
+    // 只算减敌；命运同担的 PlayerStrengthLoss（削自己）不计入。
+    private static readonly string[] _enemyStrengthLossKeys = { "StrengthLoss", "EnemyStrengthLoss" };
+
+    // 警示卡判定（身体光晕 UpdatePurpleGlow 与卡牌紫光 ApplyHighlight 共用同一标准）：
+    //   联机专属卡 / 减敌力量 / 施加虚弱或易伤
+    internal static bool IsWarningCard(CardModel card)
+        => card.MultiplayerConstraint == CardMultiplayerConstraint.MultiplayerOnly
+        || _enemyStrengthLossKeys.Any(k => card.DynamicVars.ContainsKey(k))
+        || card.DynamicVars.Values.Any(v => v.GetType() == _weakVarType
+                                         || v.GetType() == _vulnerableVarType);
 
     private static readonly FieldInfo _isHighlightedField =
         AccessTools.Field(typeof(NMultiplayerPlayerState), "_isHighlighted");
@@ -184,11 +202,7 @@ public static class PeekHandPatch
         var player = state.Player;
         if (player?.PlayerCombatState == null) return false;
         if (player.NetId == LocalContext.NetId) return false;
-        return player.PlayerCombatState.Hand.Cards.Any(card =>
-            card.MultiplayerConstraint == CardMultiplayerConstraint.MultiplayerOnly
-            || card.DynamicVars.ContainsKey(StrengthLossKey)
-            || card.DynamicVars.Values.Any(v => v.GetType() == _weakVarType
-                                             || v.GetType() == _vulnerableVarType));
+        return player.PlayerCombatState.Hand.Cards.Any(IsWarningCard);
     }
 
     internal static void UpdatePurpleGlow(NMultiplayerPlayerState state)
@@ -242,9 +256,39 @@ public static class PeekHandPatch
             body.Modulate = Colors.White;
     }
 
+    // 状态栏右缘（state 局部 X）：完全对齐游戏自身 UpdateSelectionReticleWidth 的算法 ——
+    // max(最右可见信息栏右缘, 血条 HpBarContainer 右缘) + 6。
+    // 关键：血条宽度按 HP 比例定（UpdateHealthBarWidth），战士等高 HP 角色【血条比 3/5 信息栏更宽】，
+    // 其状态栏真实右缘是血条而非信息栏；只量信息栏会让卡条没跟上宽血条。储君/低 HP 角色信息栏更宽，max 仍取信息栏、不变。
+    // 容器布局未完成时（Size 仍为 0）回退到固定值，由后续重建/延后一帧校正。
+    private static float ContentRightFor(NMultiplayerPlayerState state)
+    {
+        float right = 0f;
+        foreach (string name in _infoColumns)
+        {
+            var c = state.GetNodeOrNull<Control>(name);
+            if (c != null && GodotObject.IsInstanceValid(c) && c.Visible && c.Size.X > 1f)
+            {
+                float edge = c.GlobalPosition.X + c.Size.X - state.GlobalPosition.X;   // → state 局部右缘
+                if (edge > right) right = edge;
+            }
+        }
+        // 并入血条右缘（与游戏算法一致）
+        var hp = state.GetNodeOrNull<NHealthBar>("%HealthBar");
+        Control? bar = hp != null && GodotObject.IsInstanceValid(hp) ? hp.HpBarContainer : null;
+        if (bar != null && GodotObject.IsInstanceValid(bar) && bar.Size.X > 1f)
+        {
+            float edge = bar.GlobalPosition.X + bar.Size.X - state.GlobalPosition.X;
+            if (edge > right) right = edge;
+        }
+        return right > 1f ? right + ContentRightMargin : BarContentRightFallback;
+    }
+
     private static void ShowOverlay(NMultiplayerPlayerState state)
     {
         if (!PeekSettings.MasterEnabled) return;
+        if (_hideHeld) return;              // 长按临时隐藏期间：不弹大图（松开时若仍在悬停会由 HoldHideTick 补弹）
+        if (!IsCombatViewActive()) return;  // 只在战斗视图弹大图（防补弹/直调把大图画到地图/牌堆之上）
 
         Player player = state.Player;
 
@@ -315,12 +359,12 @@ public static class PeekHandPatch
             else cardNode.CardHighlight.AnimHideInstantly();
         }
 
-        // 延后一帧设置位置（用稳定的 state 锚点，而非 hover 才赋值的 Hitbox.Size.X）
+        // 延后一帧设置位置（此时状态栏布局已完成 → ContentRightFor 能读到真实内容宽度，含储君的辉星栏）
         Callable.From(() =>
         {
             if (!overlay.IsInsideTree()) return;
             overlay.GlobalPosition = new Vector2(
-                state.GlobalPosition.X + BarContentRight + PeekSettings.OverlayGapPx,
+                state.GlobalPosition.X + ContentRightFor(state) + PeekSettings.OverlayGapPx,
                 state.GlobalPosition.Y + BarHeight / 2f   // 卡牌 y=0 → 从状态栏中线向下展开（大图保持原样）
             );
         }).CallDeferred();
@@ -329,9 +373,7 @@ public static class PeekHandPatch
     }
 
     // 优先级（高→低）：紫 > 红 > 金
-    //   紫：施加虚弱/易伤的卡牌（DynamicVars 含 PowerVar<WeakPower/VulnerablePower>）
-    //       + 降低敌人力量 (ContainsKey(StrengthLossKey))
-    //       + 多人专属卡（MultiplayerOnly)
+    //   紫：见 IsWarningCard —— 施加虚弱/易伤 + 减敌力量 + 联机专属卡
     //   红：游戏原生 ShouldGlowRed（Osty 角色相关、Enthralled 诅咒等）
     //   金：游戏原生 ShouldGlowGold（特殊触发条件满足，仅可打出时显示）
     private static void ApplyHighlight(NCard cardNode, bool thumbnail = false)
@@ -342,10 +384,7 @@ public static class PeekHandPatch
         var model = cardNode.Model;
         if (model == null) return;
 
-        bool isPurple = model.MultiplayerConstraint == CardMultiplayerConstraint.MultiplayerOnly
-                     || model.DynamicVars.ContainsKey(StrengthLossKey)
-                     || model.DynamicVars.Values.Any(v => v.GetType() == _weakVarType
-                                                       || v.GetType() == _vulnerableVarType);
+        bool isPurple = IsWarningCard(model);
         bool isRed    = model.ShouldGlowRed;
         bool isGold   = model.CanPlay() && model.ShouldGlowGold;
 
@@ -537,10 +576,18 @@ void fragment() {
             xOffset += CardNaturalWidth * scale + spacing;       // 与大图完全相同
         }
 
-        // 挂在 state 下，局部坐标 = 大图「state 右侧 + 状态栏中线」在 state 局部空间的等价：
-        //   局部(BarContentRight+gap, BarHeight/2)  ≡  全局(state.X+267+gap, state.Y+32)
+        // 挂在 state 下，局部坐标 = 「内容右缘 + 间距」「状态栏中线」。内容右缘动态测量（含储君辉星栏）。
         state.AddChild(strip);
-        strip.Position = new Vector2(BarContentRight + PeekSettings.ThumbnailGapPx, BarHeight / 2f);  // 缩略图与状态栏间距（独立于大图）
+        strip.Position = new Vector2(ContentRightFor(state) + PeekSettings.ThumbnailGapPx, BarHeight / 2f);
+
+        // 状态栏布局可能在本帧尚未完成（储君的辉星栏 Size 还是 0）→ 延后一帧按真实宽度再校正一次
+        var capturedStrip = strip;
+        Callable.From(() =>
+        {
+            if (GodotObject.IsInstanceValid(capturedStrip) && capturedStrip.IsInsideTree()
+                && _thumbnails.TryGetValue(state, out var cur) && cur == capturedStrip)
+                capturedStrip.Position = new Vector2(ContentRightFor(state) + PeekSettings.ThumbnailGapPx, BarHeight / 2f);
+        }).CallDeferred();
 
         foreach (NCard cardNode in cardNodes)
         {
@@ -553,9 +600,8 @@ void fragment() {
         _thumbnails[state] = strip;
 
         // 可见性单一真源：与 MaybeRestoreThumbnails 判据完全一致——有任一队友被悬停、
-        // 或仍有大图存在时隐藏；否则显示。（旧代码只看 _highlightedStates、漏看 _overlays：
-        // 在悬停/大图存在时重建会把刚建好的缩略图永久藏到下次取消悬停才恢复。）
-        strip.Visible = _highlightedStates.Count == 0 && _overlays.Count == 0;
+        // 或仍有大图存在、或战斗视图被地图/卡组/牌堆等遮挡时隐藏；否则显示。
+        strip.Visible = ShouldThumbnailsShow();
     }
 
     internal static void DestroyThumbnail(NMultiplayerPlayerState state)
@@ -589,12 +635,65 @@ void fragment() {
             if (GodotObject.IsInstanceValid(strip)) strip.Visible = visible;
     }
 
-    // 仅当「无人被悬停」且「没有大图还在显示」时才恢复缩略图
+    // 仅当「无人被悬停」「没有大图还在显示」且「战斗视图未被遮挡」时才恢复缩略图
     // （延迟消失期间大图仍在 _overlays 里 → 不恢复，避免大图与缩略图同框）
+    // 缩略图「应否显示」的单一真源：无人悬停、无大图、在战斗视图、且未长按隐藏。
+    // RebuildThumbnail 与 MaybeRestoreThumbnails 共用，避免判据重复而将来改漏其中一条。
+    private static bool ShouldThumbnailsShow()
+        => _highlightedStates.Count == 0 && _overlays.Count == 0 && IsCombatViewActive() && !_hideHeld;
+
     private static void MaybeRestoreThumbnails()
     {
-        if (_highlightedStates.Count == 0 && _overlays.Count == 0)
+        if (ShouldThumbnailsShow())
             SetAllThumbnailsVisible(true);
+    }
+
+    /* == 活动屏幕门控：只在「战斗视图」显示，打开地图/卡组/抽牌堆/弃牌堆等时收起 == */
+
+    // 战斗视图当前是否未被遮挡。ActiveScreenContext 是游戏权威的「当前活动屏幕」解析器，
+    // 仅在 capstone/地图/牌堆视图/inspect 等都没打开时才返回 CombatRoom。
+    internal static bool IsCombatViewActive()
+    {
+        try { return ActiveScreenContext.Instance?.GetCurrentScreen() is NCombatRoom; }
+        catch { return false; }
+    }
+
+    // 长按中键临时隐藏：每帧读中键的【实时按住状态】，状态翻转时才动作（非切换、非点击检测）。
+    // 按住 → 隐藏所有缩略图；松开 → 恢复。_hideHeld 已并入可见性判据，按住期间的重建也保持隐藏。
+    internal static void HoldHideTick()
+    {
+        if (!PeekSettings.MasterEnabled) return;
+        // 绑定键：默认 None → 鼠标中键；绑了键就用键（读实时按住状态）
+        Key k = PeekSettings.HoldHideKey;
+        bool held = k == Key.None ? Input.IsMouseButtonPressed(MouseButton.Middle) : Input.IsKeyPressed(k);
+        if (held == _hideHeld) return;   // 状态未变则不重复处理（避免每帧重设）
+        _hideHeld = held;
+        if (held)
+        {
+            SetAllThumbnailsVisible(false);
+            foreach (var s in _overlays.Keys.ToList()) HideOverlay(s);   // 大图也收起（与"打开地图/牌堆时收起大图"语义一致）
+        }
+        else
+        {
+            MaybeRestoreThumbnails();
+            // 松开时若仍在悬停某队友，重新弹出其大图（按住期间被收起了）
+            foreach (var s in _highlightedStates.ToList())
+                if (!_overlays.ContainsKey(s)) ShowOverlay(s);
+        }
+    }
+
+    // 订阅 ActiveScreenContext.Updated：地图/卡组/牌堆等开关时被调用。
+    // 被遮挡 → 收起所有缩略图与大图；回到战斗视图 → 按 hover 状态恢复缩略图。
+    internal static void OnScreenChanged()
+    {
+        if (!PeekSettings.MasterEnabled) return;
+        if (IsCombatViewActive())
+            MaybeRestoreThumbnails();
+        else
+        {
+            SetAllThumbnailsVisible(false);
+            foreach (var s in _overlays.Keys.ToList()) HideOverlay(s);
+        }
     }
 
     /* == 设置即时生效 == */

@@ -17,7 +17,9 @@ internal static class PeekDevPanel
     private static PanelContainer? _panel;
     private static bool _built;
     private static bool _autoOpened;
+    private static bool _wantOpen;             // 用户「想打开」意图；实际可见性 = _wantOpen && 战斗视图未被遮挡
     private static bool _keyDown;
+    private static bool _toggleDown;           // 快速开关缩略图快捷键的边沿跟踪
     private static bool _suppress;             // 程序化刷新控件时抑制控件自身回调
     private static bool _applying;             // 本面板自身改动时跳过 RefreshWidgets，避免自回声
     private static bool _userMoved;            // 用户拖动过 → 不再自动重新停靠
@@ -40,11 +42,11 @@ internal static class PeekDevPanel
 
     private static void OnFrame()
     {
-        // 默认打开：首帧 Root 可能还没就绪 → 每帧重试，构建并显示后才置位（只自动开一次）
+        // 默认打开：首帧 Root 可能还没就绪 → 每帧重试，构建后置「想开」（只自动开一次，实际显示仍受战斗视图门控）
         if (DefaultOpen && !_autoOpened)
         {
             if (!_built) Build();
-            if (_layer != null) { _layer.Visible = true; Reposition(); RefreshWidgets(); _autoOpened = true; }
+            if (_layer != null) { _wantOpen = true; _autoOpened = true; }
         }
 
         // 拖动标题：按下时记抓取偏移，之后每帧跟随鼠标（即使鼠标移出标题也跟手）
@@ -65,9 +67,36 @@ internal static class PeekDevPanel
         {
             if (IsTypingInTextField())
                 Log.Info($"[MultiplayerPeeking] panel hotkey suppressed (focused text field: {FocusName()})");
-            else Toggle();
+            else if (PeekHandPatch.IsCombatViewActive())
+                Toggle();
+            else
+                Log.Info("[MultiplayerPeeking] panel hotkey ignored (not in combat view)");
         }
         _keyDown = down;
+
+        // 快速开关缩略图：ThumbnailToggleHotkey（默认 -）。边沿触发，切换 ThumbnailsEnabled 并即时重建。
+        Key tkey = PeekSettings.ThumbnailToggleHotkey;
+        bool tdown = tkey != Key.None && Input.IsKeyPressed(tkey);
+        if (tdown && !_toggleDown && !IsTypingInTextField())
+        {
+            PeekSettings.ThumbnailsEnabled = !PeekSettings.ThumbnailsEnabled;
+            PeekSettings.ScheduleSave();
+            PeekSettings.NotifyChanged();
+            Log.Info($"[MultiplayerPeeking] thumbnails toggled → {PeekSettings.ThumbnailsEnabled}");
+        }
+        _toggleDown = tdown;
+
+        // 只在「战斗视图」(未被地图/卡组/抽牌堆/弃牌堆等遮挡)显示；其余场景自动隐藏，但记住开关意图。
+        // 关闭遮挡屏幕回到战斗时自动重现（_wantOpen 仍为真）。
+        if (_built && _layer != null)
+        {
+            bool show = _wantOpen && PeekHandPatch.IsCombatViewActive();
+            if (show != _layer.Visible)
+            {
+                _layer.Visible = show;
+                if (show) { Reposition(); RefreshWidgets(); }
+            }
+        }
     }
 
     // 仅当焦点确实落在【可见】文本框时才屏蔽快捷键。host 退出大厅后可能残留一个【隐藏】文本框仍占焦点，
@@ -120,9 +149,9 @@ internal static class PeekDevPanel
     {
         if (!_built) Build();
         if (_layer == null) { Log.Warn("[MultiplayerPeeking] panel build failed; can't show"); return; }
-        _layer.Visible = !_layer.Visible;
-        Log.Info($"[MultiplayerPeeking] panel toggled → visible={_layer.Visible} pos={_panel?.Position}");
-        if (_layer.Visible) { Reposition(); RefreshWidgets(); }
+        _wantOpen = !_wantOpen;
+        Log.Info($"[MultiplayerPeeking] panel toggled → wantOpen={_wantOpen}");
+        // 实际可见性由 OnFrame 按战斗视图门控（_wantOpen && IsCombatViewActive）
     }
 
     // 内容坐标系尺寸（含内容缩放/Retina 时与窗口物理像素不同）。用它定位才不会被算到屏外。
@@ -303,11 +332,62 @@ internal static class PeekDevPanel
         var row = new HBoxContainer();
         row.AddChild(new Label { Text = label, SizeFlagsHorizontal = Control.SizeFlags.ExpandFill });
         var cb = new CheckBox { ButtonPressed = get() };
+        StyleCheckBox(cb);   // 关闭态也保持可见的方框轮廓（游戏主题里 unchecked 图标透明，用户找不到）
         cb.Toggled += on => { if (!_suppress) Apply(key, on, () => setField(on)); };
         row.AddChild(cb);
         parent.AddChild(row);
         _refreshers.Add(() => cb.ButtonPressed = get());
         return row;
+    }
+
+    // 游戏主题里勾选框「未勾选」图标完全透明 → 关闭态看不见框。覆盖 checked/unchecked 图标为自绘方框：
+    // 未勾选=空心描边框，勾选=描边框+对勾✓，两态都有清晰轮廓。图标全局共用一份。
+    private static ImageTexture? _iconOff, _iconOn;
+    private static void StyleCheckBox(CheckBox cb)
+    {
+        _iconOff ??= MakeCheckIcon(false);
+        _iconOn  ??= MakeCheckIcon(true);
+        cb.AddThemeIconOverride("unchecked", _iconOff);
+        cb.AddThemeIconOverride("unchecked_disabled", _iconOff);
+        cb.AddThemeIconOverride("checked", _iconOn);
+        cb.AddThemeIconOverride("checked_disabled", _iconOn);
+    }
+
+    private static ImageTexture MakeCheckIcon(bool on)
+    {
+        const int n = 24, b = 2;
+        var img = Image.CreateEmpty(n, n, false, Image.Format.Rgba8);
+        img.Fill(new Color(0, 0, 0, 0));
+        Color border = new Color(0.80f, 0.84f, 0.90f, 1f);   // 描边方框（始终可见）
+        for (int x = 0; x < n; x++)
+            for (int y = 0; y < n; y++)
+                if (x < b || x >= n - b || y < b || y >= n - b)
+                    img.SetPixel(x, y, border);
+        // 勾选 = 画对勾 ✓（两段线）；未勾选 = 仅空心框
+        if (on)
+        {
+            Color check = new Color(0.45f, 0.85f, 1f, 1f);
+            DrawSeg(img, new Vector2(6, 12), new Vector2(10, 16), check, n);
+            DrawSeg(img, new Vector2(10, 16), new Vector2(18, 7), check, n);
+        }
+        return ImageTexture.CreateFromImage(img);
+    }
+
+    // 在图上沿 a→b 画一条粗线（3px 笔刷）：采样插值，每点涂一个 3×3 方块
+    private static void DrawSeg(Image img, Vector2 a, Vector2 b, Color col, int n)
+    {
+        for (int i = 0; i <= 64; i++)
+        {
+            float t = i / 64f;
+            int cx = Mathf.RoundToInt(Mathf.Lerp(a.X, b.X, t));
+            int cy = Mathf.RoundToInt(Mathf.Lerp(a.Y, b.Y, t));
+            for (int dx = -1; dx <= 1; dx++)
+                for (int dy = -1; dy <= 1; dy++)
+                {
+                    int x = cx + dx, y = cy + dy;
+                    if (x >= 0 && x < n && y >= 0 && y < n) img.SetPixel(x, y, col);
+                }
+        }
     }
 
     private static Control AddSlider(VBoxContainer parent, string label, string suffix,
@@ -491,6 +571,9 @@ internal static class PeekDevPanel
             PeekSettings.ThumbnailGapPx        = PeekSettings.DefaultThumbnailGapPx;
             PeekSettings.ThumbnailOpacityPct   = PeekSettings.DefaultThumbnailOpacityPct;
             PeekSettings.ThumbnailShowGlow     = PeekSettings.DefaultThumbnailShowGlow;
+            PeekSettings.PanelHotkey           = PeekSettings.DefaultPanelHotkey;
+            PeekSettings.HoldHideKey           = PeekSettings.DefaultHoldHideKey;
+            PeekSettings.ThumbnailToggleHotkey = PeekSettings.DefaultThumbnailToggleHotkey;
             PeekSettings.Save();
             PeekSettings.NotifyChanged();
         }

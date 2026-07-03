@@ -35,6 +35,9 @@ public static class PeekSettings
     public const  int   DefaultThumbnailSpacingPx  = 2;      // 0–40 ；缩略图卡牌间隔（绝对 px，独立于大图）
     public const  int   DefaultThumbnailGapPx      = 0;      // 0–120；缩略图与状态栏间距（独立于大图）
     public const  Key   DefaultPanelHotkey         = Key.F8;  // 设置面板开关快捷键
+    public const  Key   DefaultHoldHideKey            = Key.None;   // 长按临时隐藏缩略图/大图；None=鼠标中键
+    public const  Key   DefaultThumbnailToggleHotkey  = Key.Minus;  // 快速开关缩略图的快捷键
+    public const  string DefaultLastSeenHintVersion   = "";         // 已看过的一次性更新提示版本（内部用）
 
     // —— 通用 ——
     public static bool  MasterEnabled       = DefaultMasterEnabled;
@@ -62,8 +65,13 @@ public static class PeekSettings
     public static int   ThumbnailSpacingPx  = DefaultThumbnailSpacingPx;
     public static int   ThumbnailGapPx      = DefaultThumbnailGapPx;
 
-    // —— 设置面板 ——
-    public static Key   PanelHotkey         = DefaultPanelHotkey;
+    // —— 设置面板 / 快捷键 ——
+    public static Key   PanelHotkey            = DefaultPanelHotkey;
+    public static Key   HoldHideKey            = DefaultHoldHideKey;
+    public static Key   ThumbnailToggleHotkey  = DefaultThumbnailToggleHotkey;
+
+    // —— 内部标记（非玩家可调）——
+    public static string LastSeenHintVersion   = DefaultLastSeenHintVersion;
 
     // —— 派生 ——
     public static float  CardScale        => CardScalePct / 100f;
@@ -131,6 +139,9 @@ public static class PeekSettings
             ThumbnailSpacingPx  = cfg.GetValue(Section, nameof(ThumbnailSpacingPx),  ThumbnailSpacingPx).AsInt32();
             ThumbnailGapPx      = cfg.GetValue(Section, nameof(ThumbnailGapPx),      ThumbnailGapPx).AsInt32();
             PanelHotkey         = (Key)cfg.GetValue(Section, nameof(PanelHotkey),    (int)PanelHotkey).AsInt32();
+            HoldHideKey            = (Key)cfg.GetValue(Section, nameof(HoldHideKey),            (int)HoldHideKey).AsInt32();
+            ThumbnailToggleHotkey  = (Key)cfg.GetValue(Section, nameof(ThumbnailToggleHotkey),  (int)ThumbnailToggleHotkey).AsInt32();
+            LastSeenHintVersion = cfg.GetValue(Section, nameof(LastSeenHintVersion), LastSeenHintVersion).AsString();
         }
         catch (Exception e)
         {
@@ -166,6 +177,9 @@ public static class PeekSettings
             cfg.SetValue(Section, nameof(ThumbnailSpacingPx),  ThumbnailSpacingPx);
             cfg.SetValue(Section, nameof(ThumbnailGapPx),      ThumbnailGapPx);
             cfg.SetValue(Section, nameof(PanelHotkey),         (int)PanelHotkey);
+            cfg.SetValue(Section, nameof(HoldHideKey),            (int)HoldHideKey);
+            cfg.SetValue(Section, nameof(ThumbnailToggleHotkey),  (int)ThumbnailToggleHotkey);
+            cfg.SetValue(Section, nameof(LastSeenHintVersion), LastSeenHintVersion);
 
             if (cfg.Save(SavePath) != Error.Ok)
                 Log.Warn("[MultiplayerPeeking] settings save returned an error");
