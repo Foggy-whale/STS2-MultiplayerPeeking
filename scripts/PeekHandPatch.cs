@@ -14,6 +14,7 @@ using MegaCrit.Sts2.Core.Nodes.Multiplayer;
 using MegaCrit.Sts2.Core.Nodes.Pooling;
 using MegaCrit.Sts2.Core.Nodes.Combat;
 using MegaCrit.Sts2.Core.Nodes.Rooms;
+using MegaCrit.Sts2.Core.Nodes.Screens.CardSelection;
 using MegaCrit.Sts2.Core.Nodes.Screens.ScreenContext;
 
 namespace MultiplayerPeeking;
@@ -36,12 +37,27 @@ public static class PeekHandCombatEndedPatch
 {
     public static void Prefix(NMultiplayerPlayerState __instance)
     {
-        PeekHandPatch.UnsubscribeHandEvents(__instance);
-        PeekHandPatch.ForgetHighlight(__instance);
-        PeekHandPatch.HideOverlay(__instance);
-        PeekHandPatch.DestroyThumbnail(__instance);
+        PeekHandPatch.ClearState(__instance);
         PeekHandPatch.RestoreAllPrismatic();   // 兜底清扫残留棱彩卡
     }
+}
+
+// 退回主菜单/断线退出也会销毁状态栏，但不一定触发 CombatEnded。
+[HarmonyPatch(typeof(NMultiplayerPlayerState), nameof(NMultiplayerPlayerState._ExitTree))]
+public static class PeekHandStateExitedPatch
+{
+    public static void Prefix(NMultiplayerPlayerState __instance) => PeekHandPatch.ClearState(__instance);
+}
+
+// 局内选牌界面（生存者/工具箱/选择悖论/牌堆查看等）的「窥视」按钮：按下时选牌网格被藏起、
+// 战斗视图重新可见，但选牌屏仍在 NOverlayStack 上（GetCurrentScreen 仍返回它）。而且「开始窥视」
+// 不会触发 ActiveScreenContext.Update（只有取消窥视才触发）→ 我们的门控收不到通知。
+// 故在此对 SetPeeking 补一发刷新，让缩略图/预览随窥视开合而显隐
+//（IsCombatViewActive 已把「正在窥视的选牌屏」视作战斗视图可见）。
+[HarmonyPatch(typeof(NPeekButton), nameof(NPeekButton.SetPeeking), new[] { typeof(bool) })]
+public static class PeekPeekButtonPatch
+{
+    public static void Postfix() => PeekHandPatch.OnScreenChanged();
 }
 
 [HarmonyPatch(typeof(NMultiplayerPlayerState), "UpdateHighlightedState")]
@@ -84,8 +100,8 @@ public static class PeekHandPatch
     // 对角色 Body 施加紫色光效
     private static readonly Dictionary<NMultiplayerPlayerState, Node2D> _tintedBodies = [];
 
-    // 直接订阅 Hand.ContentsChanged，存储 handler 以便精确取消订阅
-    private static readonly Dictionary<NMultiplayerPlayerState, Action> _handHandlers = [];
+    // 保存实际订阅的牌堆：退出/重连时 PlayerCombatState 可能已被替换或清空。
+    private static readonly Dictionary<NMultiplayerPlayerState, (CardPile Hand, Action Handler)> _handHandlers = [];
 
     // 棱彩高光：被换成共享彩虹材质的卡 → 其原始(每卡唯一)材质。归还对象池前据此还原，
     // 否则池子复用到真实手牌会让真手牌变彩虹（NCard 池可能与游戏共用）。
@@ -148,20 +164,7 @@ public static class PeekHandPatch
                 && !_overlayHovered.Contains(__instance)
                 && !_hideTimers.ContainsKey(__instance))
             {
-                var tree = __instance.GetTree();
-                if (tree == null) HideOverlay(__instance);
-                else
-                {
-                    var timer = tree.CreateTimer(PeekSettings.HideDelaySec);
-                    _hideTimers[__instance] = timer;
-                    timer.Timeout += () =>
-                    {
-                        _hideTimers.Remove(__instance);
-                        bool stillHighlighted = _isHighlightedField.GetValue(__instance) is true;
-                        if (!stillHighlighted && !_overlayHovered.Contains(__instance))
-                            HideOverlay(__instance);
-                    };
-                }
+                ScheduleHide(__instance);
             }
 
             // 仅当无人被悬停【且没有大图还在显示】时才恢复缩略图。
@@ -177,22 +180,50 @@ public static class PeekHandPatch
 
     internal static void SubscribeHandEvents(NMultiplayerPlayerState state)
     {
-        if (_handHandlers.ContainsKey(state)) return;
+        UnsubscribeHandEvents(state);
         var player = state.Player;
         if (player?.PlayerCombatState == null) return;
         if (player.NetId == LocalContext.NetId) return;
 
         void handler() => OnHandChanged(state);
-        player.PlayerCombatState.Hand.ContentsChanged += handler;
-        _handHandlers[state] = handler;
+        var hand = player.PlayerCombatState.Hand;
+        hand.ContentsChanged += handler;
+        _handHandlers[state] = (hand, handler);
     }
 
     internal static void UnsubscribeHandEvents(NMultiplayerPlayerState state)
     {
-        if (!_handHandlers.Remove(state, out var handler)) return;
-        var player = state.Player;
-        if (player?.PlayerCombatState != null)
-            player.PlayerCombatState.Hand.ContentsChanged -= handler;
+        if (_handHandlers.Remove(state, out var subscription))
+            subscription.Hand.ContentsChanged -= subscription.Handler;
+    }
+
+    internal static void ClearState(NMultiplayerPlayerState state)
+    {
+        UnsubscribeHandEvents(state);
+        _hideTimers.Remove(state);
+        _overlayHovered.Remove(state);
+        _highlightedStates.Remove(state);
+        HideOverlay(state);
+        DestroyThumbnail(state);
+        RemovePurpleGlow(state);
+    }
+
+    private static void ScheduleHide(NMultiplayerPlayerState state)
+    {
+        var tree = state.GetTree();
+        if (tree == null) { HideOverlay(state); return; }
+
+        var timer = tree.CreateTimer(PeekSettings.HideDelaySec);
+        _hideTimers[state] = timer;
+        timer.Timeout += () =>
+        {
+            // 移出字典即取消；旧计时器不能清除后来的计时器，也不能访问已释放的状态栏。
+            if (!_hideTimers.TryGetValue(state, out var current) || current != timer) return;
+            _hideTimers.Remove(state);
+            if (!GodotObject.IsInstanceValid(state) || !state.IsInsideTree()) return;
+            if (_isHighlightedField.GetValue(state) is not true && !_overlayHovered.Contains(state))
+                HideOverlay(state);
+        };
     }
 
     /* == 紫色光效 == */
@@ -334,16 +365,7 @@ public static class PeekHandPatch
             bool highlighted = _isHighlightedField.GetValue(state) is true;
             if (!highlighted && _overlays.ContainsKey(state) && !_hideTimers.ContainsKey(state))
             {
-                var tree = state.GetTree();
-                if (tree == null) { HideOverlay(state); return; }
-                var timer = tree.CreateTimer(PeekSettings.HideDelaySec);
-                _hideTimers[state] = timer;
-                timer.Timeout += () =>
-                {
-                    _hideTimers.Remove(state);
-                    if (_isHighlightedField.GetValue(state) is not true && !_overlayHovered.Contains(state))
-                        HideOverlay(state);
-                };
+                ScheduleHide(state);
             }
         };
 
@@ -362,7 +384,8 @@ public static class PeekHandPatch
         // 延后一帧设置位置（此时状态栏布局已完成 → ContentRightFor 能读到真实内容宽度，含储君的辉星栏）
         Callable.From(() =>
         {
-            if (!overlay.IsInsideTree()) return;
+            if (!GodotObject.IsInstanceValid(overlay) || !overlay.IsInsideTree()
+                || !GodotObject.IsInstanceValid(state) || !state.IsInsideTree()) return;
             overlay.GlobalPosition = new Vector2(
                 state.GlobalPosition.X + ContentRightFor(state) + PeekSettings.OverlayGapPx,
                 state.GlobalPosition.Y + BarHeight / 2f   // 卡牌 y=0 → 从状态栏中线向下展开（大图保持原样）
@@ -494,6 +517,8 @@ void fragment() {
 
     internal static void HideOverlay(NMultiplayerPlayerState state)
     {
+        _hideTimers.Remove(state);
+        _overlayHovered.Remove(state);
         if (!_overlays.Remove(state, out var overlay)) return;
 
         // 先把卡牌从 overlay 摘除，再归还对象池；
@@ -625,8 +650,6 @@ void fragment() {
         strip.QueueFree();
     }
 
-    internal static void ForgetHighlight(NMultiplayerPlayerState state) => _highlightedStates.Remove(state);
-
     // 任一队友被悬停时隐藏【所有】缩略图；无人被悬停时全部恢复
     private static void SetAllThumbnailsVisible(bool visible)
     {
@@ -652,9 +675,27 @@ void fragment() {
 
     // 战斗视图当前是否未被遮挡。ActiveScreenContext 是游戏权威的「当前活动屏幕」解析器，
     // 仅在 capstone/地图/牌堆视图/inspect 等都没打开时才返回 CombatRoom。
+    // v0.113 的三类选牌场景都使用唯一节点名 %PeekButton；避免依赖各自的私有字段。
+    private static bool IsPeekingSelectionScreen(object? screen)
+    {
+        if (screen is not (NCardGridSelectionScreen or NChooseACardSelectionScreen or NChooseABundleSelectionScreen))
+            return false;
+        if (screen is not Control control || !GodotObject.IsInstanceValid(control) || !control.IsInsideTree())
+            return false;
+        return control.GetNodeOrNull<NPeekButton>("%PeekButton")?.IsPeeking ?? false;
+    }
+
     internal static bool IsCombatViewActive()
     {
-        try { return ActiveScreenContext.Instance?.GetCurrentScreen() is NCombatRoom; }
+        try
+        {
+            if (NCombatRoom.Instance == null) return false;
+            var screen = ActiveScreenContext.Instance?.GetCurrentScreen();
+            if (screen is NCombatRoom) return true;
+            // 局内选牌界面按下「窥视」按钮 → 选牌网格被藏起、战斗视图可见 → 允许预览队友手牌。
+            // 未窥视（网格覆盖战斗）时仍视作被遮挡而收起，与查看牌堆/卡组的行为保持一致。
+            return IsPeekingSelectionScreen(screen);
+        }
         catch { return false; }
     }
 

@@ -19,3 +19,5 @@ packages/
 
 # Local build / release output
 /dist/
+tests/**/obj/
+tests/**/__pycache__/

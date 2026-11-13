@@ -1,5 +1,21 @@
 # 更新日志 / Changelog
 
+## v1.1.3
+
+### 兼容 / Compatibility
+- 针对游戏 **v0.113.0** 重新构建，声明最低游戏版本 `0.113.0`。
+  Rebuilt for game **v0.113.0**, with a declared minimum game version of `0.113.0`.
+- 资源包导出排除依赖缓存、历史会话、构建产物和外部清单，避免夹带旧版本文件。
+  Resource exports exclude dependency caches, session history, build outputs, and the external manifest.
+- 固定构建分析器版本并移除未使用的 BaseLib 引用；内联双语文案不再触发缺少本地化表的构建错误。
+  Pin the build analyzer and remove the unused BaseLib reference; inline bilingual UI text no longer triggers a missing-localization-table build error.
+
+### 修复 / Fixed
+- 选牌界面点击「窥视」时恢复队友手牌预览，覆盖网格、单卡和卡牌组选择；通过场景的 `%PeekButton` 节点读取状态。
+  Ally hand previews now return when peeking from grid, single-card, and card-bundle selection screens.
+- 退出对局时取消原手牌堆的事件订阅并清理预览、缩略图和身体染色；取消的延迟隐藏回调不会再访问已销毁的状态栏或干扰新的预览。
+  Leaving a run clears hand subscriptions and preview effects. Cancelled hide callbacks no longer access freed player UI or interfere with a newer preview.
+
 ## v1.1.2
 
 ### 修复 / Fixed

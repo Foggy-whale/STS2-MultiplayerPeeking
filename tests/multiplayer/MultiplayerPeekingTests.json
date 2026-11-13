@@ -1,0 +1,11 @@
+{
+  "id": "MultiplayerPeekingTests",
+  "name": "Multiplayer Peeking integration test probe",
+  "author": "MultiplayerPeeking contributors",
+  "version": "1.0.0",
+  "min_game_version": "0.113.0",
+  "has_dll": true,
+  "has_pck": false,
+  "affects_gameplay": true,
+  "dependencies": [{ "id": "MultiplayerPeeking", "min_version": "1.1.3" }]
+}

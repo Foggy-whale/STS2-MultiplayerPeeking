@@ -62,7 +62,8 @@
     <PropertyGroup>
         <!-- Diasble architecture mismatch warning; mods are ideally built for all platforms (MSIL)
              while your local StS2 version will be for your specific platform. -->
-        <NoWarn>$(NoWarn);MSB3270</NoWarn> 
+        <!-- UI text is selected in code; this mod has no localization tables or custom models. -->
+        <NoWarn>$(NoWarn);MSB3270;STS002</NoWarn>
     </PropertyGroup>
 
     <ItemGroup Condition="Exists('$(Sts2DataDir)')" >
@@ -78,11 +79,11 @@
     </ItemGroup>
 
     <ItemGroup>
-        <PackageReference Include="Alchyr.Sts2.BaseLib" Version="*" PrivateAssets="All" />
-        <PackageReference Include="Alchyr.Sts2.ModAnalyzers" Version="*" />
+        <PackageReference Include="Alchyr.Sts2.ModAnalyzers" Version="0.2.1" PrivateAssets="All" />
     </ItemGroup>
 
     <ItemGroup>
+        <Compile Remove="tests/**/*.cs" />
         <None Include=".gitignore" />
         <None Include="project.godot"/>
         <None Include="MultiplayerPeeking/**" />
@@ -104,7 +105,7 @@
                 Condition="'$(GodotPath)' == '' or !Exists('$(GodotPath)')" />
     </Target>
 
-    <Target Name="CopyToModsFolderOnBuild" AfterTargets="PostBuildEvent">
+    <Target Name="CopyToModsFolderOnBuild" AfterTargets="PostBuildEvent" Condition="'$(DeployMod)' != 'false'">
         <Message Text="Copying .dll and manifest to mods folder." Importance="high" />
         <Copy SourceFiles="$(TargetPath)" DestinationFolder="$(ModsPath)$(MSBuildProjectName)/" />
         <Copy SourceFiles="MultiplayerPeeking.json" DestinationFolder="$(ModsPath)$(MSBuildProjectName)/" />
